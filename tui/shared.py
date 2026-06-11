@@ -44,6 +44,8 @@ class PathConfig(BaseModel):
     def bot_log(self, name: str) -> Path: return self.cache_dir / name / "logs" / f"bot_log_{name}.jsonl"
     def bot_system_prompts(self, name: str) -> Path: return self.bot_prompts(name) / "system_prompts.yaml"
     def bot_prompt_formats(self, name: str) -> Path: return self.bot_prompts(name) / "prompt_formats.yaml"
+    def bot_pid(self, name: str) -> Path: return self.cache_dir / name / "bot.pid"
+    def bot_tui_names(self, name: str) -> Path: return self.cache_dir / name / "tui_names.json"
 
 
 @dataclass
@@ -56,10 +58,18 @@ class BotInstance:
     process: Optional[Any] = None
     running: bool = False
     worker: Optional[Any] = None
+    external_pid: Optional[int] = None   # set for processes detected on TUI startup
 
     @property
     def instance_id(self) -> str:
         return self.bot_name.lower().replace(" ", "-")
+
+    @property
+    def pid(self) -> Optional[int]:
+        """Active PID regardless of whether the process was launched or detected."""
+        if self.process is not None:
+            return self.process.pid
+        return self.external_pid
 
 
 class AppState:
@@ -104,6 +114,7 @@ def get_api_env_key(api: str) -> Optional[str]:
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "vllm": "VLLM_API_KEY",
+        "unsloth": "UNSLOTH_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
         "gemini": "GEMINI_API_KEY",
     }.get(api)
@@ -123,6 +134,25 @@ def discover_bots() -> list[str]:
         if p.is_dir() and not p.name.startswith((".", "__", "archive"))
     ]
     return sorted(bots) if bots else ["default"]
+
+
+def check_pid_running(pid: int) -> bool:
+    """Return True if a process with the given PID is currently alive.
+
+    Uses tasklist on Windows (signal 0 is unreliable there), os.kill(0) on Unix.
+    """
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in result.stdout
+        else:
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        return False
 
 
 def get_bot_caches() -> list[str]:
@@ -182,8 +212,24 @@ def list_anthropic_models() -> list[str]:
 def list_vllm_models() -> list[str]:
     try:
         import urllib.request, json
-        base = os.getenv("VLLM_API_BASE", "http://localhost:4000")
-        with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as r:
+        base = os.getenv("VLLM_API_BASE", "http://localhost:4000").rstrip("/")
+        models_url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+        with urllib.request.urlopen(models_url, timeout=5) as r:
+            return [m["id"] for m in json.loads(r.read().decode()).get("data", [])]
+    except Exception:
+        return []
+
+
+def list_unsloth_models() -> list[str]:
+    k = os.getenv("UNSLOTH_API_KEY")
+    if not k:
+        return []
+    try:
+        import urllib.request, json
+        base = os.getenv("UNSLOTH_API_BASE", "http://localhost:8888").rstrip("/")
+        models_url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+        req = urllib.request.Request(models_url, headers={"Authorization": f"Bearer {k}"})
+        with urllib.request.urlopen(req, timeout=5) as r:
             return [m["id"] for m in json.loads(r.read().decode()).get("data", [])]
     except Exception:
         return []
@@ -225,6 +271,7 @@ MODEL_LISTERS = {
     "openai": list_openai_models,
     "anthropic": list_anthropic_models,
     "vllm": list_vllm_models,
+    "unsloth": list_unsloth_models,
     "openrouter": list_openrouter_models,
     "gemini": list_gemini_models,
 }
@@ -320,6 +367,27 @@ def save_memory_cache(cache: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+def load_tui_names(bot_name: str) -> dict:
+    """Load cached user_id → display_name mapping for TUI chat."""
+    path = PATHS.bot_tui_names(bot_name)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_tui_names(bot_name: str, names: dict) -> None:
+    """Persist user_id → display_name mapping to disk."""
+    path = PATHS.bot_tui_names(bot_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def search_memories(cache: dict, query: str, user_id: str = None, page: int = 1, per_page: int = 20) -> dict:
@@ -813,9 +881,10 @@ class SelectableItem(ListItem):
         self.label, self.value, self.subtitle, self.available = label, value, subtitle, available
 
     def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
         status = "✓" if self.available else "✗"
         marker = f"[bold]{status}[/bold]" if self.available else f"[dim]{status}[/dim]"
-        t = f"{marker} [bold]{self.label}[/bold]"
+        t = f"{marker} [bold]{_esc(self.label)}[/bold]"
         if self.subtitle:
-            t += f"  [dim]{self.subtitle}[/dim]"
+            t += f"  [dim]{_esc(self.subtitle)}[/dim]"
         yield Label(t)

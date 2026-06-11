@@ -1,6 +1,6 @@
 """Launch page for the Agent Manager TUI."""
 
-import io, os, sys, asyncio, subprocess, contextlib
+import io, json, os, sys, asyncio, subprocess, contextlib
 from typing import Optional, Any
 
 from textual import on, work
@@ -12,7 +12,26 @@ from tui.shared import (
     SCRIPT_DIR, STATE, PATHS, SUPPORTED_APIS, BotInstance,
     discover_bots, check_api_available, get_default_model,
     get_api_env_key, get_models_for_api, SelectableItem,
+    check_pid_running,
 )
+
+LOG_READ_BYTES = 4096
+LOG_LINE_LIMIT = 8000
+
+
+def _trim_log_line(text: str, limit: int = LOG_LINE_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    keep_start = limit // 2
+    keep_end = limit - keep_start
+    return f"{text[:keep_start]}\n[dim]... omitted {omitted} chars from long log line ...[/dim]\n{text[-keep_end:]}"
+
+
+def _write_process_log(log: RichLog, text: str) -> None:
+    text = _trim_log_line(text.rstrip())
+    s = "bold" if "ERROR" in text else "bold" if "WARNING" in text else "" if "INFO" in text else "dim"
+    log.write(f"[{s}]{text}[/{s}]" if s else text)
 
 
 class BotInstanceCard(Vertical):
@@ -95,6 +114,7 @@ class LaunchPage(Vertical):
         self.query_one("#dmn-model-list", ListView).append(
             SelectableItem("chronpression", "chronpression", "no LLM required", True)
         )
+        self._scan_existing_pids()
 
     def _populate_bots(self):
         lv = self.query_one("#bot-list", ListView)
@@ -141,8 +161,10 @@ class LaunchPage(Vertical):
         if target == "#dmn-model-list":
             lv.append(SelectableItem("(same)", "", "use main model", True))
             lv.append(SelectableItem("chronpression", "chronpression", "no LLM required", True))
-        for m in models:
+        for m in models or ([d] if d else []):
             lv.append(SelectableItem(m, m, "(default)" if m == d else "", True))
+        if target == "#model-list":
+            self.query_one("#model-input", Input).value = d or ""
 
     @on(ListView.Selected, "#bot-list")
     async def on_bot_selected(self, event: ListView.Selected):
@@ -275,64 +297,174 @@ class LaunchPage(Vertical):
         instance.running = True
         log.write(f"[dim]pid={instance.process.pid}[/dim]\n")
 
+        # Write PID file so a future TUI session can reattach to this process
+        try:
+            pid_file = PATHS.bot_pid(instance.bot_name)
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(json.dumps({
+                "pid": instance.process.pid,
+                "bot_name": instance.bot_name,
+                "api": instance.api,
+                "model": instance.model,
+            }), encoding="utf-8")
+        except Exception:
+            pass
+
+        pending_log = ""
         while instance.running and instance.process.returncode is None:
             try:
-                line = await asyncio.wait_for(instance.process.stdout.readline(), timeout=0.1)
-                if line:
-                    t = line.decode("utf-8", errors="replace").rstrip()
-                    s = "bold" if "ERROR" in t else "bold" if "WARNING" in t else "" if "INFO" in t else "dim"
-                    log.write(f"[{s}]{t}[/{s}]" if s else t)
+                chunk = await asyncio.wait_for(instance.process.stdout.read(LOG_READ_BYTES), timeout=0.1)
+                if chunk:
+                    pending_log += chunk.decode("utf-8", errors="replace")
+                    while "\n" in pending_log:
+                        line, pending_log = pending_log.split("\n", 1)
+                        _write_process_log(log, line)
+                    if len(pending_log) > LOG_LINE_LIMIT:
+                        _write_process_log(log, pending_log)
+                        pending_log = ""
+                elif pending_log:
+                    _write_process_log(log, pending_log)
+                    pending_log = ""
             except asyncio.TimeoutError:
                 continue
+
+        if pending_log:
+            _write_process_log(log, pending_log)
 
         if instance.process.returncode is None:
             await self._kill_instance(instance, log)
 
         instance.running = False
+        PATHS.bot_pid(instance.bot_name).unlink(missing_ok=True)
         log.write(f"\n[bold]exited code={instance.process.returncode}[/bold]")
         card.update_status(False)
         self.app.update_global_status()
 
     async def _kill_instance(self, instance: BotInstance, log: RichLog = None):
         """Gracefully terminate a bot instance via CTRL+C / SIGINT."""
-        if not instance.process or instance.process.returncode is not None:
+        # Determine active PID — launched instances use process.pid, detected
+        # instances use external_pid (process is None in that case).
+        if instance.process is not None and instance.process.returncode is not None:
+            return  # subprocess already finished
+        pid = instance.pid
+        if pid is None:
             return
 
-        pid = instance.process.pid
         if log:
             log.write(f"[bold]sending interrupt to pid={pid}...[/bold]\n")
 
+        import signal
         try:
             if sys.platform == "win32":
-                import signal
                 os.kill(pid, signal.CTRL_BREAK_EVENT)
             else:
-                import signal
                 os.killpg(os.getpgid(pid), signal.SIGINT)
         except Exception as e:
             if log:
                 log.write(f"[bold]signal error: {e}[/bold]\n")
 
-        try:
-            await asyncio.wait_for(instance.process.wait(), timeout=10)
+        if instance.process is not None:
+            # Launched this session — we have an asyncio subprocess to wait on
+            try:
+                await asyncio.wait_for(instance.process.wait(), timeout=10)
+                if log:
+                    log.write("graceful shutdown complete\n")
+                PATHS.bot_pid(instance.bot_name).unlink(missing_ok=True)
+                return
+            except asyncio.TimeoutError:
+                if log:
+                    log.write("[bold]graceful shutdown timeout, forcing...[/bold]\n")
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=5)
+                else:
+                    instance.process.kill()
+                await asyncio.wait_for(instance.process.wait(), timeout=3)
+            except Exception:
+                pass
+        else:
+            # Detected pre-existing process — poll until it dies
+            for _ in range(10):
+                await asyncio.sleep(1)
+                alive = await asyncio.to_thread(check_pid_running, pid)
+                if not alive:
+                    if log:
+                        log.write("graceful shutdown complete\n")
+                    PATHS.bot_pid(instance.bot_name).unlink(missing_ok=True)
+                    return
             if log:
-                log.write(f"graceful shutdown complete\n")
-            return
-        except asyncio.TimeoutError:
-            if log:
-                log.write(f"[bold]graceful shutdown timeout, forcing...[/bold]\n")
+                log.write("[bold]graceful shutdown timeout, forcing...[/bold]\n")
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=5)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
 
-        try:
-            if sys.platform == "win32":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=5)
-            else:
-                instance.process.kill()
-            await asyncio.wait_for(instance.process.wait(), timeout=3)
-        except Exception:
-            pass
-
+        PATHS.bot_pid(instance.bot_name).unlink(missing_ok=True)
         if log:
-            log.write(f"process terminated\n")
+            log.write("process terminated\n")
+
+    @work()
+    async def _scan_existing_pids(self):
+        """Detect bot.pid files left by processes that outlived a previous TUI session."""
+        if not PATHS.cache_dir.exists():
+            return
+        for pid_file in PATHS.cache_dir.glob("*/bot.pid"):
+            try:
+                data = json.loads(pid_file.read_text(encoding="utf-8"))
+                pid = int(data["pid"])
+                bot_name = data.get("bot_name", pid_file.parent.name)
+                api = data.get("api", "?")
+                model = data.get("model", "?")
+            except Exception:
+                continue
+
+            if STATE.is_bot_running(bot_name):
+                continue  # already tracked this session
+
+            alive = await asyncio.to_thread(check_pid_running, pid)
+            if not alive:
+                pid_file.unlink(missing_ok=True)
+                continue
+
+            instance = BotInstance(
+                bot_name=bot_name, api=api, model=model,
+                running=True, external_pid=pid,
+            )
+            STATE.instances[bot_name] = instance
+            await self._add_instance_card(instance)
+
+            try:
+                card = self.query_one(f"#card-{instance.instance_id}", BotInstanceCard)
+                log = card.get_log()
+                log.write(f"[dim]detected existing process pid={pid}[/dim]\n")
+                log.write(f"[dim]log streaming unavailable for pre-existing processes[/dim]\n")
+            except Exception:
+                pass
+
+            self._watch_external_pid(instance)
+            self.app.update_global_status()
+
+    @work()
+    async def _watch_external_pid(self, instance: BotInstance):
+        """Poll a detected-but-not-launched process until it exits."""
+        pid = instance.external_pid
+        while instance.running:
+            await asyncio.sleep(3)
+            alive = await asyncio.to_thread(check_pid_running, pid)
+            if not alive:
+                instance.running = False
+                PATHS.bot_pid(instance.bot_name).unlink(missing_ok=True)
+                try:
+                    card = self.query_one(f"#card-{instance.instance_id}", BotInstanceCard)
+                    card.get_log().write(f"\n[bold]process pid={pid} exited[/bold]")
+                    card.update_status(False)
+                except Exception:
+                    pass
+                self.app.update_global_status()
+                break
 
     async def _add_instance_card(self, instance: BotInstance):
         """Add a new instance card to the instances panel."""

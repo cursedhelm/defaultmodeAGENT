@@ -45,16 +45,27 @@ Button:disabled { background: $bg; color: #888; border: solid #888; }
 Input { background: $bg; color: black; border: solid black; margin: 0 1 0 0; }
 Input:focus { border: solid black; }
 
-/* Selects */
-Select { background: $bg; color: black; margin: 0 1 0 0; }
+/* Selects — Textual 3.x: SelectOverlay inherits from OptionList;
+   theme generates $surface:#1e1e1e, $block-cursor-background:#0178d4 (blue),
+   $block-hover-background:#ffffff0c (transparent) — override all of them. */
+Select { background: $bg; color: black; margin: 0 1 0 0; height: auto; }
 SelectCurrent { background: $bg; color: black; }
-Select > SelectCurrent { border: tall black; }
-Select:focus > SelectCurrent { border: tall black; }
+Select > SelectCurrent { border: solid black; background: $bg; }
+Select:focus > SelectCurrent { border: solid black; background: $bg; }
 SelectOverlay { background: $bg; color: black; border: solid black; }
+Select > SelectOverlay { background: $bg; color: black; border: solid black; }
 SelectOverlay > .option-list--option { color: black; background: $bg; }
 SelectOverlay > .option-list--option-highlighted { color: $bg; background: black; text-style: bold; }
 SelectOverlay > .option-list--option-hover { color: $bg; background: black; }
 SelectOverlay:focus > .option-list--option-highlighted { color: $bg; background: black; text-style: bold; }
+
+/* OptionList — SelectOverlay is a subclass; style both so highlights/hover
+   don't bleed through with dark-theme $block-cursor-background (blue). */
+OptionList { background: $bg; color: black; border: solid black; }
+OptionList > .option-list--option { color: black; background: $bg; }
+OptionList > .option-list--option-highlighted { color: $bg; background: black; text-style: bold; }
+OptionList > .option-list--option-hover { color: $bg; background: black; }
+OptionList:focus > .option-list--option-highlighted { color: $bg; background: black; text-style: bold; }
 
 /* Checkbox */
 Checkbox { margin: 0 1 0 0; border: none; background: $bg; color: black; }
@@ -65,12 +76,13 @@ Checkbox:focus { border: none; background: $bg; }
 Checkbox:focus > .toggle--label { color: $bg; background: black; text-style: bold; }
 Checkbox:focus > .toggle--button { color: black; background: $bg; }
 
-/* ListView */
+/* ListView — Textual 3.x uses -highlight (single dash) and -hovered */
 ListView { background: $bg; border: solid black; }
 ListView:focus { border: solid black; }
 ListItem { background: $bg; color: black; }
-ListItem:hover { background: $bg; color: black; }
-ListItem.--highlight { background: black; color: $bg; border: none; }
+ListItem.-hovered { background: black; color: $bg; }
+ListItem.-highlight { background: black; color: $bg; }
+ListView:focus > ListItem.-highlight { background: black; color: $bg; }
 
 /* TextArea */
 TextArea { background: $bg; color: black; border: solid black; }
@@ -190,6 +202,27 @@ VizPage { height: 1fr; background: $bg; }
 .viz-conn-item Label { height: auto; }
 .viz-conn-item Static { height: auto; margin-top: 1; }
 
+/* === ChatPage === */
+ChatPage { height: 1fr; background: $bg; }
+#chat-root { height: 1fr; }
+#chat-sidebar { width: 32; height: 1fr; padding: 1; border-right: solid black; }
+#chat-sidebar Label { height: auto; margin-bottom: 0; }
+#chat-bot-list { height: 1fr; margin-bottom: 1; }
+#chat-api-list { height: 1fr; margin-bottom: 1; }
+#chat-model-list { height: 1fr; margin-bottom: 0; }
+#chat-model-input { height: auto; margin-bottom: 1; }
+#chat-user-list { height: 1fr; margin-bottom: 0; }
+#chat-user-input { height: auto; margin-bottom: 1; }
+#chat-resolve-btn { width: 100%; margin: 0 0 1 0; height: auto; }
+#chat-use-names { height: auto; border: none; margin-bottom: 1; background: $bg; }
+#chat-connect-btn { width: 100%; margin: 0; height: auto; }
+#chat-panel { width: 1fr; padding: 1; }
+#chat-status { height: auto; margin-bottom: 1; }
+#chat-log { height: 1fr; margin-bottom: 1; }
+#chat-input-row { height: auto; }
+#chat-input-row Input { width: 1fr; margin: 0 1 0 0; }
+#chat-input-row Button { width: auto; min-width: 8; margin: 0; }
+
 /* === ConfigPage === */
 ConfigPage { height: 1fr; background: $bg; }
 #cfg-root { height: 1fr; }
@@ -197,14 +230,14 @@ ConfigPage { height: 1fr; background: $bg; }
 .cfg-sidebar Select { width: 100%; margin-bottom: 1; }
 .cfg-sidebar Button { width: 100%; margin-bottom: 1; }
 .cfg-bot-status { height: auto; margin-bottom: 1; }
-.cfg-hint { height: auto; color: $text-muted; }
+.cfg-hint { height: auto; color: #888888; }
 .cfg-main { width: 1fr; height: 1fr; background: $bg; }
 #cfg-tabs { height: 1fr; }
 .cfg-actions { height: auto; margin-top: 1; align: left middle; }
 .cfg-actions Button { margin-right: 1; }
 .cfg-actions Label { width: auto; content-align: left middle; }
 .cfg-field-row { height: auto; padding: 0 0 1 0; align: left middle; }
-.cfg-overridden { background: $boost; }
+.cfg-overridden { background: #ffd0d8; }
 .cfg-field-label { width: 40%; height: auto; content-align: left middle; }
 .cfg-field-control { width: 30%; height: auto; }
 .cfg-field-control.cfg-field-switch { width: auto; margin-left: 1; }

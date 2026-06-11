@@ -195,6 +195,9 @@ class DiscordConfig(BaseModel):
     """Discord-specific configuration"""
     channel_id: str = Field(default=os.getenv('DISCORD_CHANNEL_ID'))
     bot_manager_role: str = Field(default='Ally')
+    sync_slash_commands: bool = Field(default=os.getenv('DISCORD_SYNC_SLASH_COMMANDS', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    slash_guild_id: str = Field(default=os.getenv('DISCORD_SLASH_GUILD_ID'))
+    global_slash_commands: bool = Field(default=os.getenv('DISCORD_GLOBAL_SLASH_COMMANDS', 'false').lower() in ('1', 'true', 'yes', 'on'))
     
     system_commands: Set[str] = Field(default={ 'kill', 'resume', 'get_logs', 'dmn', 'mentions', 'persona', 'search_memories', 'spike' })
     management_commands: Set[str] = Field(default={ 'add_memory', 'index_repo', 'reranking', 'clear_memories', 'attention', 'spike' })
@@ -236,6 +239,44 @@ class DiscordConfig(BaseModel):
             return True
         if (command_name in self.management_commands and
             any(role.name == self.bot_manager_role for role in ctx.author.roles)):
+            return True
+        return False
+
+    def has_interaction_permission(self, command_name: str, interaction) -> bool:
+        if command_name not in (
+            self.system_commands |
+            self.management_commands |
+            self.general_commands
+        ):
+            return False
+        user = interaction.user
+        if getattr(user, 'bot', False):
+            return command_name in self.bot_action_commands
+        if command_name in self.general_commands:
+            return True
+        if isinstance(interaction.channel, discord.DMChannel) or interaction.guild is None:
+            has_admin = False
+            has_ally = False
+            for guild in interaction.client.guilds:
+                member = guild.get_member(user.id)
+                if not member:
+                    continue
+                if (member.guild_permissions.administrator or
+                    member.guild_permissions.manage_guild):
+                    has_admin = True
+                    break
+                if any(role.name == self.bot_manager_role for role in member.roles):
+                    has_ally = True
+            if command_name in self.system_commands:
+                return has_admin
+            if command_name in self.management_commands:
+                return has_admin or has_ally
+            return False
+        permissions = getattr(user, 'guild_permissions', None)
+        if permissions and (permissions.administrator or permissions.manage_guild):
+            return True
+        if (command_name in self.management_commands and
+            any(role.name == self.bot_manager_role for role in getattr(user, 'roles', []))):
             return True
         return False
     

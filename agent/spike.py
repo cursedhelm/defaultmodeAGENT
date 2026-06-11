@@ -45,6 +45,7 @@ from chunker import truncate_middle, clean_response
 from discord_utils import sanitize_mentions, format_discord_mentions
 from attention import format_themes_for_prompt, get_current_themes
 from temporality import TemporalParser
+from thinking_trace import separate_thinking_traces, store_thinking_traces
 from bot_config import config as bot_config
 from memory import AtomicSaver
 from context import (
@@ -474,6 +475,13 @@ class SpikeProcessor:
                     system_prompt=system_prompt,
                     temperature=temperature
                 )
+            response, thinking_traces = separate_thinking_traces(response)
+            await store_thinking_traces(
+                self.memory_index,
+                str(self.bot.user.id),
+                self.bot.user.name,
+                thinking_traces,
+            )
             response = clean_response(response)
             timestamp_label = prompt_state.timestamp
 
@@ -595,6 +603,13 @@ class SpikeProcessor:
                 prompt=thought_prompt,
                 system_prompt=thought_system,
                 temperature=self.bot.amygdala_response / 100
+            )
+            thought_response, thinking_traces = separate_thinking_traces(thought_response)
+            await store_thinking_traces(
+                self.memory_index,
+                str(self.bot.user.id),
+                self.bot.user.name,
+                thinking_traces,
             )
             thought_response = clean_response(thought_response)
             reflection = f"Reflections on spike to {location} ({storage_timestamp}):\n{thought_response}"

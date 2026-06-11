@@ -1,5 +1,6 @@
 #discord
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands.view import StringView
 # standard libraries
@@ -14,6 +15,7 @@ import threading
 import re
 import importlib.util
 import sys
+from typing import Optional
 # api import and hyperparameter handlers
 from hippocampus import Hippocampus, HippocampusConfig
 from context import (
@@ -38,6 +40,7 @@ from memory import UserMemoryIndex, CacheManager
 from defaultmode import DMNProcessor
 from chunker import truncate_middle, clean_response, balance_wraps
 from temporality import TemporalParser
+from thinking_trace import separate_thinking_traces, store_thinking_traces
 # Discord Format Handling
 from discord_utils import sanitize_mentions, format_discord_mentions
 from attention import check_attention_triggers_fuzzy, get_current_themes, format_themes_for_prompt
@@ -112,6 +115,18 @@ def update_temperature(intensity: int) -> None:
         bot.dmn_processor.amygdala_response = intensity
         bot.dmn_processor.temperature = TEMPERATURE
     bot.logger.info(f"Updated bot temperature to {TEMPERATURE} across all components")
+
+async def interaction_send(interaction: discord.Interaction, content: str, *, ephemeral: bool = True) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(content, ephemeral=ephemeral)
+
+async def require_interaction_permission(command_name: str, interaction: discord.Interaction) -> bool:
+    if config.discord.has_interaction_permission(command_name, interaction):
+        return True
+    await interaction_send(interaction, "You don't have permission to use this command.", ephemeral=True)
+    return False
 
 def currentmoment():
     return datetime.now().strftime("%H:%M [%d/%m/%y]")
@@ -319,6 +334,8 @@ async def process_message(message, memory_index, prompt_formats, system_prompts,
                 temperature=bot.amygdala_response/100,
                 image_paths=url_image_paths if url_image_paths else None
             )
+            response_content, thinking_traces = separate_thinking_traces(response_content)
+            await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)
             response_content = clean_response(response_content)
         finally:
             typing_task.cancel()
@@ -597,6 +614,8 @@ async def process_files(message, memory_index, prompt_formats, system_prompts, u
                 image_paths=temp_paths if temp_paths else None,
                 temperature=bot.amygdala_response/100
             )
+            response_content, thinking_traces = separate_thinking_traces(response_content)
+            await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)
             response_content = clean_response(response_content)
         finally:
             typing_task.cancel()
@@ -849,6 +868,8 @@ async def generate_and_save_thought(memory_index, user_id, user_name, memory_tex
         image_paths=image_paths,
         temperature=bot.amygdala_response/100
     )
+    thought_response, thinking_traces = separate_thinking_traces(thought_response)
+    await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)
     thought_response = clean_response(thought_response)
     memory_string = f"Reflections on interactions with @{user_name} ({storage_timestamp}):\n {thought_response}"
     bot.logger.debug(f"Pre-memory addition string: {memory_string}")
@@ -1162,14 +1183,55 @@ def setup_bot(prompt_path=None, bot_id=None):
     bot.processing_enabled = True
     bot.mentions_enabled = False
     bot.attention_enabled = True
+    bot._slash_commands_synced = False
+
+    # AgentRuntime helpers — satisfy runtime.AgentRuntime protocol
+    async def _resolve_user(user_id: str) -> str:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            return user.name if user else f"User({user_id})"
+        except Exception:
+            return f"User({user_id})"
+    bot.resolve_user = _resolve_user
+
+    # Build the DiscordAdapter now; agent_id/agent_name set after on_ready
+    from adapters.discord_adapter import DiscordAdapter
+    bot._adapter = DiscordAdapter(bot)
 
     @bot.event
     async def on_ready():
         bot.logger.info(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
 
+        # Wire AgentRuntime identity properties now that user is known
+        bot.agent_id = str(bot.user.id)
+        bot.agent_name = bot.user.name
+
         bot.dmn_processor.logger = BotLogger(bot.user.name)
         bot.loop.create_task(bot.dmn_processor.start())
         bot.logger.info('DMN processor started')
+
+        if config.discord.sync_slash_commands and not bot._slash_commands_synced:
+            try:
+                if config.discord.slash_guild_id:
+                    guild = discord.Object(id=int(config.discord.slash_guild_id))
+                    bot.tree.copy_global_to(guild=guild)
+                    synced = await bot.tree.sync(guild=guild)
+                    bot.logger.info(f"Synced {len(synced)} slash commands to guild {config.discord.slash_guild_id}")
+                elif config.discord.global_slash_commands:
+                    synced = await bot.tree.sync()
+                    bot.logger.info(f"Synced {len(synced)} global slash commands")
+                else:
+                    total_synced = 0
+                    for guild in bot.guilds:
+                        bot.tree.copy_global_to(guild=guild)
+                        synced = await bot.tree.sync(guild=guild)
+                        total_synced += len(synced)
+                        bot.logger.info(f"Synced {len(synced)} slash commands to guild {guild.id} ({guild.name})")
+                    bot.logger.info(f"Synced {total_synced} slash command registrations across {len(bot.guilds)} guilds")
+                bot._slash_commands_synced = True
+            except Exception as e:
+                bot.logger.error(f"Slash command sync failed: {str(e)}")
+                bot.logger.error(traceback.format_exc())
 
         log_to_jsonl({
             'event': 'bot_ready',
@@ -1187,7 +1249,7 @@ def setup_bot(prompt_path=None, bot_id=None):
         if ctx.command is not None:
             await bot.invoke(ctx)
             return
-        
+
         uid = str(message.author.id)
         attn = False
         if bot.attention_enabled:
@@ -1200,111 +1262,158 @@ def setup_bot(prompt_path=None, bot_id=None):
             )
 
         if isinstance(message.channel, discord.DMChannel) or bot.user in message.mentions or any(r in message.guild.me.roles for r in message.role_mentions) or attn:
-            
-            content, reply_context, reply_attachments = await extract_content_and_reply(message, False, bot)
-            all_attachments = list(message.attachments) + reply_attachments
-            
-            has_supported_files = False
-            for att in all_attachments:
-                ext = os.path.splitext(att.filename.lower())[1]
-                if (ext in ALLOWED_EXTENSIONS) or (att.content_type and att.content_type.startswith('image/') and ext in ALLOWED_IMAGE_EXTENSIONS):
-                    has_supported_files = True
-                    break
 
-            if has_supported_files:
-                try:
-                    await process_files(
-                        message=message,
-                        memory_index=memory_index,
-                        prompt_formats=prompt_formats,
-                        system_prompts=system_prompts,
-                        user_message=content,
-                        bot=bot,
-                        attachments=all_attachments
-                    )
-                except Exception as e:
-                    await message.channel.send(f"Error processing file(s): {str(e)}")
-                    bot.logger.error(f"Error during process_files call from on_message: {str(e)}")
-                    bot.logger.error(traceback.format_exc())
-            else:
-                await process_message(message, memory_index, prompt_formats, system_prompts, github_repo, is_command=False)
+            from agent_core import process_message as _core_process_message
+            norm_msg = await bot._adapter.normalize(message, is_command=False)
 
-    @bot.command(name='persona')
-    @commands.check(lambda ctx: config.discord.has_command_permission('persona', ctx))
-    async def set_amygdala_response(ctx, intensity: int = None):
-        """Set emotional intensity 0-100. Lower=calm/focused, higher=creative/volatile."""
+            try:
+                await _core_process_message(
+                    msg=norm_msg,
+                    adapter=bot._adapter,
+                    runtime=bot,
+                    memory_index=memory_index,
+                    prompt_formats=prompt_formats,
+                    system_prompts=system_prompts,
+                    github_repo=github_repo,
+                )
+            except Exception as e:
+                await message.channel.send(f"Error processing message: {str(e)}")
+                bot.logger.error(f"Error during on_message dispatch: {str(e)}")
+                bot.logger.error(traceback.format_exc())
+
+    async def handle_persona(intensity: Optional[int], actor=None) -> str:
         if intensity is None:
-            await ctx.send(f"Current amygdala arousal is {bot.amygdala_response}%.")
-        elif 0 <= intensity <= 100:
+            return f"Current amygdala arousal is {bot.amygdala_response}%."
+        if 0 <= intensity <= 100:
             bot.amygdala_response = intensity
             update_temperature(intensity)
             success_msg = f"Amygdala arousal set to {intensity}%"
             if hasattr(bot, 'dmn_processor') and bot.dmn_processor:
                 success_msg += ". DMN processor synchronized."
-            await ctx.send(success_msg)
+            return success_msg
+        if actor:
+            bot.logger.warning(f"Invalid amygdala arousal attempted by {actor}: {intensity}")
         else:
-            await ctx.send("Please provide a valid intensity between 0 and 100.")
             bot.logger.warning(f"Invalid amygdala arousal attempted: {intensity}")
+        return "Please provide a valid intensity between 0 and 100."
 
-    @bot.command(name='attention')
-    @commands.check(lambda ctx: config.discord.has_command_permission('attention', ctx))
-    async def toggle_attention(ctx, state: str = None):
-        """Toggle topic-based triggers. When on, responds to relevant topics without @mention."""
-        if state is None:
+    async def handle_attention(state: Optional[str]) -> str:
+        if state is None or state.lower() == 'status':
             status = "enabled" if bot.attention_enabled else "disabled"
-            await ctx.send(f"Attention triggers are currently **{status}**")
             bot.logger.info(f"Attention status queried: {status}")
-            return
+            return f"Attention triggers are currently **{status}**"
         if state.lower() in ['on', 'enable', 'true', '1']:
             bot.attention_enabled = True
-            await ctx.send("✅ Attention triggers **enabled** - I'll respond to topic-based triggers")
-        elif state.lower() in ['off', 'disable', 'false', '0']:
+            return "Attention triggers **enabled** - I'll respond to topic-based triggers"
+        if state.lower() in ['off', 'disable', 'false', '0']:
             bot.attention_enabled = False
-            await ctx.send("❌ Attention triggers **disabled** - I'll only respond to mentions and DMs")
-        else:
-            await ctx.send("Usage: `!attention on` or `!attention off`")
-            bot.logger.warning(f"Invalid attention command attempted: {state}")
+            return "Attention triggers **disabled** - I'll only respond to mentions and DMs"
+        bot.logger.warning(f"Invalid attention command attempted: {state}")
+        return "Usage: `!attention on` or `!attention off`"
 
-    @bot.command(name='spike')
-    @commands.check(lambda ctx: config.discord.has_command_permission('spike', ctx))
-    async def spike_control(ctx, action: str = None):
-        """Control spike processor (orphaned memory outreach)."""
+    async def handle_spike(action: Optional[str]) -> str:
         sp = getattr(bot, 'spike_processor', None)
         if not sp:
-            await ctx.send("Spike processor not initialized.")
-            return
-
+            return "Spike processor not initialized."
         if action is None or action.lower() == 'status':
             status = "enabled" if sp.enabled else "disabled"
             surfaces = sp.get_recent_surfaces()
             cooldown_remaining = max(0, sp.config.cooldown_seconds - (datetime.now() - sp.last_spike).total_seconds())
-
             lines = [
                 f"**spike status:** {status}",
                 f"**surfaces:** {len(surfaces)} active",
                 f"**cooldown:** {cooldown_remaining:.0f}s remaining" if cooldown_remaining > 0 else "**cooldown:** ready",
                 f"**threshold:** {sp.config.match_threshold:.2f}"
             ]
-
             if surfaces:
                 lines.append("\n**recent surfaces:**")
                 for s in surfaces[:5]:
                     name = f"#{s.channel.name}" if hasattr(s.channel, 'name') else "DM"
                     ago = (datetime.now() - s.last_engaged).total_seconds() / 60
                     lines.append(f"  {name} ({ago:.0f}m ago)")
-
-            await ctx.send('\n'.join(lines))
-            return
-
+            return '\n'.join(lines)
         action = action.lower()
         if action in ('on', 'enable', 'start'):
             sp.enabled = True
-            await ctx.send("spike processor **enabled**")
-        elif action in ('off', 'disable', 'stop'):
+            return "spike processor **enabled**"
+        if action in ('off', 'disable', 'stop'):
             sp.enabled = False
-            await ctx.send("spike processor **disabled**")
-        else:
-            await ctx.send("usage: `!spike [on|off|status]`")
+            return "spike processor **disabled**"
+        return "usage: `!spike [on|off|status]`"
+
+    async def handle_mentions(state: Optional[str]) -> str:
+        if state is None or state.lower() == 'status':
+            return f"Mention conversion is currently {'enabled' if bot.mentions_enabled else 'disabled'}."
+        state = state.lower()
+        if state in ('on', 'true', 'enable'):
+            bot.mentions_enabled = True
+            return "Mention conversion enabled - usernames will be converted to mentions."
+        if state in ('off', 'false', 'disable'):
+            bot.mentions_enabled = False
+            return "Mention conversion disabled - usernames will remain as plain text."
+        return "Invalid state. Use: on/off/status"
+
+    async def handle_reranking(setting: Optional[str]) -> str:
+        if setting is None or setting.lower() == 'status':
+            status = "on" if config.persona.use_hippocampus_reranking else "off"
+            return f"**Memory Reranking:** {status}"
+        if setting.lower() in ('on', 'true', 'enable'):
+            config.persona.use_hippocampus_reranking = True
+            return "Memory reranking enabled"
+        if setting.lower() in ('off', 'false', 'disable'):
+            config.persona.use_hippocampus_reranking = False
+            return "Memory reranking disabled"
+        return "Invalid value. Use: on/off"
+
+    @bot.command(name='persona')
+    @commands.check(lambda ctx: config.discord.has_command_permission('persona', ctx))
+    async def set_amygdala_response(ctx, intensity: int = None):
+        """Set emotional intensity 0-100. Lower=calm/focused, higher=creative/volatile."""
+        await ctx.send(await handle_persona(intensity, ctx.author))
+
+    @bot.tree.command(name='persona', description='Set or view emotional intensity.')
+    @app_commands.describe(intensity='Optional intensity from 0 to 100')
+    @app_commands.rename(intensity='intensity')
+    async def persona_slash(interaction: discord.Interaction, intensity: app_commands.Range[int, 0, 100] = None):
+        if not await require_interaction_permission('persona', interaction):
+            return
+        await interaction_send(interaction, await handle_persona(intensity, interaction.user), ephemeral=True)
+
+    @bot.command(name='attention')
+    @commands.check(lambda ctx: config.discord.has_command_permission('attention', ctx))
+    async def toggle_attention(ctx, state: str = None):
+        """Toggle topic-based triggers. When on, responds to relevant topics without @mention."""
+        await ctx.send(await handle_attention(state))
+
+    @bot.tree.command(name='attention', description='Control topic-based attention triggers.')
+    @app_commands.describe(state='Show status or turn attention on/off')
+    @app_commands.choices(state=[
+        app_commands.Choice(name='status', value='status'),
+        app_commands.Choice(name='on', value='on'),
+        app_commands.Choice(name='off', value='off'),
+    ])
+    async def attention_slash(interaction: discord.Interaction, state: app_commands.Choice[str] = None):
+        if not await require_interaction_permission('attention', interaction):
+            return
+        await interaction_send(interaction, await handle_attention(state.value if state else None), ephemeral=True)
+
+    @bot.command(name='spike')
+    @commands.check(lambda ctx: config.discord.has_command_permission('spike', ctx))
+    async def spike_control(ctx, action: str = None):
+        """Control spike processor (orphaned memory outreach)."""
+        await ctx.send(await handle_spike(action))
+
+    @bot.tree.command(name='spike', description='Control spike orphaned-memory outreach.')
+    @app_commands.describe(action='Show status or turn spike on/off')
+    @app_commands.choices(action=[
+        app_commands.Choice(name='status', value='status'),
+        app_commands.Choice(name='on', value='on'),
+        app_commands.Choice(name='off', value='off'),
+    ])
+    async def spike_slash(interaction: discord.Interaction, action: app_commands.Choice[str] = None):
+        if not await require_interaction_permission('spike', interaction):
+            return
+        await interaction_send(interaction, await handle_spike(action.value if action else None), ephemeral=True)
 
     @bot.command(name='add_memory')
     @commands.check(lambda ctx: config.discord.has_command_permission('add_memory', ctx))
@@ -1536,6 +1645,8 @@ def setup_bot(prompt_path=None, bot_id=None):
                 themes=format_themes_for_prompt_memoized(bot.memory_index,str(ctx.author.id),mode="sections")
                 system_prompt = system_prompts['repo_file_chat'].replace('{amygdala_response}', str(bot.amygdala_response)).replace('{themes}', themes)
                 response_content = await bot.call_api(prompt, system_prompt=system_prompt)
+                response_content, thinking_traces = separate_thinking_traces(response_content)
+                await store_thinking_traces(memory_index, str(ctx.author.id), ctx.author.name, thinking_traces)
                 response_content = clean_response(response_content)
                 response_content = balance_wraps(response_content)
             finally:
@@ -1626,6 +1737,8 @@ def setup_bot(prompt_path=None, bot_id=None):
             typing_task = asyncio.create_task(maintain_typing_state(ctx.channel))
             try:
                 response = await bot.call_api(prompt, context=context, system_prompt=system_prompt)
+                response, thinking_traces = separate_thinking_traces(response)
+                await store_thinking_traces(memory_index, str(ctx.author.id), ctx.author.name, thinking_traces)
                 response = clean_response(response)
             finally:
                 typing_task.cancel()
@@ -1734,18 +1847,19 @@ def setup_bot(prompt_path=None, bot_id=None):
     @commands.check(lambda ctx: config.discord.has_command_permission('mentions', ctx))
     async def toggle_mentions(ctx, state: str = None):
         """Toggle or check mention conversion state."""
-        if state is None or state.lower() == 'status':
-            await ctx.send(f"Mention conversion is currently {'enabled' if bot.mentions_enabled else 'disabled'}.")
+        await ctx.send(await handle_mentions(state))
+
+    @bot.tree.command(name='mentions', description='Control username-to-mention conversion.')
+    @app_commands.describe(state='Show status or turn mention conversion on/off')
+    @app_commands.choices(state=[
+        app_commands.Choice(name='status', value='status'),
+        app_commands.Choice(name='on', value='on'),
+        app_commands.Choice(name='off', value='off'),
+    ])
+    async def mentions_slash(interaction: discord.Interaction, state: app_commands.Choice[str] = None):
+        if not await require_interaction_permission('mentions', interaction):
             return
-        state = state.lower()
-        if state in ('on', 'true', 'enable'):
-            bot.mentions_enabled = True
-            await ctx.send("Mention conversion enabled - usernames will be converted to mentions.")
-        elif state in ('off', 'false', 'disable'):
-            bot.mentions_enabled = False
-            await ctx.send("Mention conversion disabled - usernames will remain as plain text.")
-        else:
-            await ctx.send("Invalid state. Use: on/off/status")
+        await interaction_send(interaction, await handle_mentions(state.value if state else None), ephemeral=True)
 
     @bot.command(name='get_logs')
     @commands.check(lambda ctx: config.discord.has_command_permission('get_logs', ctx))
@@ -1804,23 +1918,24 @@ def setup_bot(prompt_path=None, bot_id=None):
         """
         Control hippocampus memory reranking.
         """
-        if setting is None:
-            status = "on" if config.persona.use_hippocampus_reranking else "off"
-            await ctx.send(f"**Memory Reranking:** {status}")
+        await ctx.send(await handle_reranking(setting))
+
+    @bot.tree.command(name='reranking', description='Control hippocampus memory reranking.')
+    @app_commands.describe(setting='Show status or turn reranking on/off')
+    @app_commands.choices(setting=[
+        app_commands.Choice(name='status', value='status'),
+        app_commands.Choice(name='on', value='on'),
+        app_commands.Choice(name='off', value='off'),
+    ])
+    async def reranking_slash(interaction: discord.Interaction, setting: app_commands.Choice[str] = None):
+        if not await require_interaction_permission('reranking', interaction):
             return
-        if setting.lower() in ('on', 'true', 'enable'):
-            config.persona.use_hippocampus_reranking = True
-            await ctx.send("✅ Memory reranking enabled")
-        elif setting.lower() in ('off', 'false', 'disable'):
-            config.persona.use_hippocampus_reranking = False
-            await ctx.send("❌ Memory reranking disabled")
-        else:
-            await ctx.send("❓ Invalid value. Use: on/off")
+        await interaction_send(interaction, await handle_reranking(setting.value if setting else None), ephemeral=True)
     return bot
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run the Discord bot with selected API and model')
-    parser.add_argument('--api', choices=['ollama', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter'], 
+    parser.add_argument('--api', choices=['ollama', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'], 
                         default='ollama', help='Choose the API to use (default: ollama)')
     parser.add_argument('--model', type=str, 
                         help='Specify the model to use. If not provided, defaults will be used based on the API.')
@@ -1829,7 +1944,7 @@ if __name__ == "__main__":
                         help='Path to prompt files directory (default: agent/prompts)')
     parser.add_argument('--bot-name', type=str,
                         help='Name of the bot to run (used for token and cache management)')
-    parser.add_argument('--dmn-api', choices=['ollama', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter'], 
+    parser.add_argument('--dmn-api', choices=['ollama', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'], 
                         help='Choose the API to use for DMN processor (default: use main API)')
     parser.add_argument('--dmn-model', type=str,
                         help='Specify the model to use for DMN processor (default: use main model)')
@@ -1880,7 +1995,7 @@ if __name__ == "__main__":
         memory_index=bot.memory_index,
         prompt_formats=bot.prompt_formats,
         system_prompts=bot.system_prompts,
-        bot=bot,
+        runtime=bot,
         dmn_api_type=config.dmn.dmn_api_type,
         dmn_model=config.dmn.dmn_model
     )

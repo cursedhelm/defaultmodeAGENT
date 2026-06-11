@@ -24,7 +24,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Footer, Label, TabbedContent, TabPane
 
-from tui import LaunchPage, LogsPage, PromptsPage, MemoryPage, VizPage, ConfigPage
+from tui import LaunchPage, LogsPage, PromptsPage, MemoryPage, VizPage, ConfigPage, ChatPage
 from tui.shared import STATE
 
 
@@ -69,6 +69,7 @@ class AgentManagerApp(App):
         Binding("4", "tab_memory", "4:Memory"),
         Binding("5", "tab_viz", "5:Viz"),
         Binding("6", "tab_config", "6:Config"),
+        Binding("7", "tab_chat", "7:Chat"),
     ]
 
     def __init__(self):
@@ -95,6 +96,8 @@ class AgentManagerApp(App):
                 yield VizPage()
             with TabPane("Config", id="tab-config"):
                 yield ConfigPage()
+            with TabPane("Chat", id="tab-chat"):
+                yield ChatPage()
         yield Label("", id="console-bar")
         yield Footer()
 
@@ -172,6 +175,9 @@ class AgentManagerApp(App):
 
     def action_tab_config(self):
         self.query_one(TabbedContent).active = "tab-config"
+
+    def action_tab_chat(self):
+        self.query_one(TabbedContent).active = "tab-chat"
 
 
 def main():

@@ -18,9 +18,19 @@ from tokenizer import count_tokens, calculate_image_tokens
 
 # ───────────────────────────  constants & init  ────────────────────────────
 MAX_IMAGE_DIM = 640
+CONSOLE_PREVIEW_CHARS = 4000
 color_init(autoreset=True)
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+
+def _console_preview(label: str, text: str | None, color: str) -> None:
+    text = text or ""
+    suffix = ""
+    if len(text) > CONSOLE_PREVIEW_CHARS:
+        suffix = f"\n... omitted {len(text) - CONSOLE_PREVIEW_CHARS} chars ..."
+        text = text[:CONSOLE_PREVIEW_CHARS]
+    print(color + f"{label} ({len(text)} chars shown){suffix}\n{text}")
 
 # ───────────────────────────  pydantic models  ─────────────────────────────
 class ProviderConfig(BaseModel):
@@ -51,6 +61,7 @@ PROVIDER_TOOL_STYLE = {
     "openrouter": "openai",
     "ollama": "openai",
     "vllm": "openai",
+    "unsloth": "openai",
     "anthropic": "anthropic",
     "gemini": "gemini",
 }
@@ -106,6 +117,26 @@ def build_chat_messages(system: str, context: str, user_content):
 def _is_gpt5(name: str | None) -> bool:
     return (name or "").lower().startswith("gpt-5")
 
+def _with_v1_base(api_base: str | None) -> str:
+    base = (api_base or "").rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
+
+def _is_gemma4(name: str | None) -> bool:
+    n = (name or "").lower()
+    return "gemma-4" in n or "gemma4" in n
+
+def _audio_format(path: str) -> str:
+    ext = os.path.splitext(path.lower())[1].lstrip(".")
+    return ext if ext in ("wav", "mp3") else "wav"
+
+def _read_b64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
 def encode_image(path: str) -> Tuple[str, Tuple[int, int]]:
     with Image.open(path) as img:
         if max(img.size) > MAX_IMAGE_DIM:
@@ -116,29 +147,70 @@ def encode_image(path: str) -> Tuple[str, Tuple[int, int]]:
         buf = BytesIO(); img.save(buf, format="JPEG", quality=75)
         return base64.b64encode(buf.getvalue()).decode(), img.size
 
-def prepare_image_content(prompt: str, image_paths: List[str], api_type: str) -> Tuple[object, list]:
-    if not image_paths: return prompt, []
+def prepare_multimodal_content(prompt: str, image_paths: List[str], audio_paths: List[str],
+                               api_type: str, model_name: str | None = None,
+                               media_parts: Optional[List[Dict[str, Any]]] = None) -> Tuple[object, list]:
+    if not image_paths and not audio_paths and not media_parts: return prompt, []
+
+    items = list(media_parts or [])
+    items.extend({"type": "image", "path": p} for p in image_paths)
+    items.extend({"type": "audio", "path": p} for p in audio_paths)
+    media_first = api_type == "gemini" or (api_type in ("ollama", "unsloth") and _is_gemma4(model_name))
+    if media_first:
+        ordered = [x for x in items if x.get("type") in ("image", "video")]
+        ordered.append({"type": "text", "text": prompt})
+        ordered.extend(x for x in items if x.get("type") == "audio")
+    else:
+        ordered = [{"type": "text", "text": prompt}, *items]
+
     if api_type == "gemini":
-        content, dims = [prompt], []
-        for p in image_paths:
-            img = Image.open(p); img.load()
-            if max(img.size) > MAX_IMAGE_DIM:
-                ratio = MAX_IMAGE_DIM / max(img.size)
-                img = img.resize(tuple(int(d * ratio) for d in img.size), Image.Resampling.LANCZOS)
-            content.append(img); dims.append(img.size)
+        content, dims = [], []
+        for item in ordered:
+            typ = item.get("type")
+            if typ == "text":
+                content.append(item.get("text", ""))
+            elif typ == "image":
+                p = item["path"]
+                img = Image.open(p); img.load()
+                if max(img.size) > MAX_IMAGE_DIM:
+                    ratio = MAX_IMAGE_DIM / max(img.size)
+                    img = img.resize(tuple(int(d * ratio) for d in img.size), Image.Resampling.LANCZOS)
+                content.append(img); dims.append(img.size)
+            elif typ == "audio":
+                content.append(types.Part.from_bytes(data=_read_bytes(item["path"]), mime_type=_mime(item["path"])))
         return content, dims
-    b64s, dims = zip(*(encode_image(p) for p in image_paths))
+
+    dims = []
     if api_type == "anthropic":
-        parts = [{"type": "text", "text": prompt}]
-        for b in b64s:
-            parts.append({"type": "image","source":{"type":"base64","media_type":"image/jpeg","data":b}})
-        return parts, list(dims)
-    if api_type in ("openai", "ollama", "openrouter", "vllm"):
-        parts = [{"type": "text", "text": prompt}]
-        for b in b64s:
-            parts.append({"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b}"}})
-        return parts, list(dims)
-    raise ValueError(f"Unsupported image provider: {api_type}")
+        parts = []
+        for item in ordered:
+            typ = item.get("type")
+            if typ == "text":
+                parts.append({"type": "text", "text": item.get("text", "")})
+            elif typ == "image":
+                b, dim = encode_image(item["path"]); dims.append(dim)
+                parts.append({"type": "image","source":{"type":"base64","media_type":"image/jpeg","data":b}})
+            elif typ == "audio":
+                raise ValueError("Audio input is not supported for anthropic")
+        return parts, dims
+    if api_type in ("openai", "ollama", "openrouter", "vllm", "unsloth"):
+        parts = []
+        for item in ordered:
+            typ = item.get("type")
+            if typ == "text":
+                parts.append({"type": "text", "text": item.get("text", "")})
+            elif typ == "image":
+                b, dim = encode_image(item["path"]); dims.append(dim)
+                parts.append({"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b}"}})
+            elif typ == "audio":
+                parts.append({"type":"input_audio","input_audio":{"data":_read_b64(item["path"]),"format":_audio_format(item["path"])}})
+            elif typ == "video":
+                raise ValueError("Video input should be expanded to frames before api_client")
+        return parts, dims
+    raise ValueError(f"Unsupported multimodal provider: {api_type}")
+
+def prepare_image_content(prompt: str, image_paths: List[str], api_type: str) -> Tuple[object, list]:
+    return prepare_multimodal_content(prompt, image_paths, [], api_type)
 
 def log_to_jsonl(data: dict, path: str = "api_calls.jsonl") -> None:
     with open(path, "a", encoding="utf-8") as f:
@@ -159,6 +231,10 @@ def get_api_config(api_type: str, model_override: str | None = None) -> Provider
         return ProviderConfig(api_base=os.getenv("VLLM_API_BASE","http://localhost:4000"),
                               api_key=_require_env("VLLM_API_KEY"),
                               model_name=model_override or os.getenv("VLLM_MODEL_NAME","google/gemma-3-4b-it"))
+    if api_type == "unsloth":
+        return ProviderConfig(api_base=os.getenv("UNSLOTH_API_BASE","http://localhost:8888"),
+                              api_key=_require_env("UNSLOTH_API_KEY"),
+                              model_name=model_override or os.getenv("UNSLOTH_MODEL_NAME","gemma-4-26B-A4B-it-GGUF"))
     if api_type == "gemini":
         return ProviderConfig(api_key=_require_env("GEMINI_API_KEY"),
                               model_name=model_override or os.getenv("GEMINI_MODEL_NAME","gemini-3-flash-preview"))
@@ -240,7 +316,8 @@ async def _openai_compat_call_with_auto_tools(*, provider: str, cfg: ProviderCon
     max_tokens_val = 12_000 if provider in ("openai", "ollama") else 12_000
     if provider == "ollama": base_url = f"{cfg.api_base}/v1"
     if provider == "openrouter": base_url = cfg.api_base
-    if provider == "vllm": base_url = f"{cfg.api_base}/v1"
+    if provider == "vllm": base_url = _with_v1_base(cfg.api_base)
+    if provider == "unsloth": base_url = _with_v1_base(cfg.api_base)
     if provider in ("ollama",): api_key = "ollama"
 
     msgs = build_chat_messages(system_prompt, context, content)
@@ -282,6 +359,8 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
                    conversation_id=None, temperature: float | None = None,
                    top_p: float | None = None, frequency_penalty: float | None = None,
                    presence_penalty: float | None = None, image_paths: List[str] | None = None,
+                   audio_paths: List[str] | None = None,
+                   media_parts: Optional[List[Dict[str, Any]]] = None,
                    api_type_override: str | None = None, model_override: str | None = None,
                    tools: Optional[List[ToolSpec]] = None,
                    tool_runtime: Optional[Dict[str, Any]] = None,
@@ -292,11 +371,15 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
     pres_pen = presence_penalty if presence_penalty is not None else api.presence_penalty
     provider = api_type_override or api.api_type
     model    = model_override or api.model_name
+    order_model = model
+    if api_type_override and not model_override:
+        try: order_model = get_api_config(provider, None).model_name
+        except Exception: pass
 
-    print(Fore.LIGHTMAGENTA_EX + (system_prompt or ""))
-    print(Fore.LIGHTCYAN_EX + prompt)
+    _console_preview("System prompt", system_prompt, Fore.LIGHTMAGENTA_EX)
+    _console_preview("User prompt", prompt, Fore.LIGHTCYAN_EX)
 
-    content, dims = prepare_image_content(prompt, image_paths or [], provider)
+    content, dims = prepare_multimodal_content(prompt, image_paths or [], audio_paths or [], provider, order_model, media_parts)
     tools_payload = adapt_tools(tools, provider)
 
     async def dispatch():
@@ -312,7 +395,7 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
         logging.info("Call → %s | model=%s T=%.2f P=%.2f FP=%.2f PP=%.2f",
                      provider, cfg.model_name, temp, p_val, freq_pen, pres_pen)
 
-        if provider in ("openai", "ollama", "openrouter", "vllm"):
+        if provider in ("openai", "ollama", "openrouter", "vllm", "unsloth"):
             if provider == "vllm" and not (cfg.api_base or "").rstrip("/").endswith(("/v1",)):
                 pass
             if auto_execute_tools and tools_payload.get("tools"):
@@ -339,14 +422,14 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
         raise ValueError(provider)
 
     response = await retry_api_call(dispatch)
-    print(Fore.MAGENTA + response)
+    _console_preview("Response", response, Fore.MAGENTA)
 
     txt = f"{system_prompt}\n{context}\n{prompt}" if (system_prompt or context) else prompt
     input_tok  = count_tokens(txt) + sum(calculate_image_tokens(w, h) for w, h in dims)
     output_tok = count_tokens(response)
     logging.info("Tokens → Input: %d | Output: %d | Total: %d", input_tok, output_tok, input_tok + output_tok)
 
-    user_field = f"[Image] {prompt}" if image_paths else prompt
+    user_field = f"[Media] {prompt}" if (image_paths or audio_paths or media_parts) else prompt
     log_to_jsonl({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "conversation_id": conversation_id,
@@ -357,14 +440,16 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
         "user_input": user_field,
         "ai_output": response,
         "is_image": bool(image_paths),
+        "is_audio": bool(audio_paths),
         "num_images": len(image_paths or []),
+        "num_audio": len(audio_paths or []),
         "input_tokens": input_tok,
         "output_tokens": output_tok,
         "total_tokens": input_tok + output_tok
     })
     return response
 
-# ─────────────────────── openai-compatible (openai/ollama/openrouter/vllm) ─────────
+# ─────────────────────── openai-compatible (openai/ollama/openrouter/vllm/unsloth) ─────────
 async def _call_openai_compat(provider: str, content, *, system_prompt, context,
                               temperature, top_p, frequency_penalty, presence_penalty,
                               config: ProviderConfig, tools_payload: dict):
@@ -377,7 +462,9 @@ async def _call_openai_compat(provider: str, content, *, system_prompt, context,
     elif provider == "openrouter":
         base_url = config.api_base
     elif provider == "vllm":
-        base_url = f"{config.api_base}/v1"
+        base_url = _with_v1_base(config.api_base)
+    elif provider == "unsloth":
+        base_url = _with_v1_base(config.api_base)
 
     msgs = build_chat_messages(system_prompt, context, content)
     m = await _openai_compat_chat(
@@ -421,12 +508,7 @@ async def _call_gemini(content, *, system_prompt, context,
                        config: ProviderConfig, tools_payload: dict):
     client = genai.Client(api_key=config.api_key)
     sys = "\n\n".join([s for s in (system_prompt, context) if s]) or None
-    if isinstance(content, list):
-        utext, imgs = content[0], content[1:]
-    else:
-        utext, imgs = str(content), []
-    paths = [getattr(i, "filename", None) for i in imgs]
-    parts = _gemini_parts_from_paths(paths) if paths and all(paths) else list(imgs)
+    parts = content if isinstance(content, list) else [str(content)]
     cfg = types.GenerateContentConfig(
         system_instruction=sys,
         temperature=temperature,
@@ -436,7 +518,7 @@ async def _call_gemini(content, *, system_prompt, context,
         response_mime_type="text/plain",
         **({} if not tools_payload.get("tools") else {"tools": tools_payload["tools"]})
     )
-    r = await asyncio.to_thread(client.models.generate_content, model=config.model_name, contents=[*parts, utext], config=cfg)
+    r = await asyncio.to_thread(client.models.generate_content, model=config.model_name, contents=parts, config=cfg)
     return (getattr(r, "text", None) or "").strip()
 
 # ─────────────────────── embeddings helper ────────────────────
@@ -489,7 +571,7 @@ if __name__ == "__main__":
     import argparse, asyncio as _aio
     ap = argparse.ArgumentParser(description="Multi-API LLM client")
     ap.add_argument("--api", required=True,
-                    choices=["ollama", "openai", "anthropic", "vllm", "openrouter", "gemini"])
+                    choices=["ollama", "openai", "anthropic", "vllm", "openrouter", "gemini", "unsloth"])
     ap.add_argument("--model", help="model override")
     ap.add_argument("--tools", action="store_true", help="enable tool calling (example: get_time)")
     args = ap.parse_args()
@@ -508,7 +590,7 @@ if __name__ == "__main__":
                 user_in,
                 tools=TOOL_SPECS if args.tools else None,
                 tool_runtime=TOOL_RUNTIME if args.tools else None,
-                auto_execute_tools=bool(args.tools) and args.api in ("openai","ollama","openrouter","vllm")
+                auto_execute_tools=bool(args.tools) and args.api in ("openai","ollama","openrouter","vllm","unsloth")
             ))
         except KeyboardInterrupt:
             break

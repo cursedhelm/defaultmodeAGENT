@@ -6,6 +6,7 @@ from datetime import datetime
 import re
 from chunker import truncate_middle, clean_response
 from temporality import TemporalParser
+from thinking_trace import separate_thinking_traces, store_thinking_traces
 from fuzzywuzzy import fuzz
 try:
     from tools.chronpression import chronomic_filter as _chronomic_filter
@@ -17,14 +18,16 @@ class DMNProcessor:
     Default Mode Network (DMN) processor that implements background thought generation
     through random memory walks and associative combination.
     """
-    def __init__(self, memory_index, prompt_formats, system_prompts, bot, dmn_config=None, mode="conservative", dmn_api_type=None, dmn_model=None):
+    def __init__(self, memory_index, prompt_formats, system_prompts, runtime, dmn_config=None, mode="conservative", dmn_api_type=None, dmn_model=None):
         # Core components
         self.memory_index = memory_index
         self.prompt_formats = prompt_formats
         self.system_prompts = system_prompts
-        self.bot = bot
-        # Use bot's logger
-        self.logger = bot.logger if hasattr(bot, 'logger') else logging.getLogger('bot.default')
+        self.runtime = runtime
+        # Keep bot as an alias for backwards-compatibility with any external callers
+        self.bot = runtime
+        # Use runtime's logger
+        self.logger = runtime.logger if hasattr(runtime, 'logger') else logging.getLogger('bot.default')
         # Load DMN configuration
         if dmn_config is None:
             from bot_config import config
@@ -119,7 +122,9 @@ class DMNProcessor:
         top_users_with_names = []
         for user_id, count in top_users:
             try:
-                user = self.bot.get_user(int(user_id))
+                # Use sync cache lookup if available (Discord), else fall back to id string
+                get_user = getattr(self.runtime, 'get_user', None)
+                user = get_user(int(user_id)) if get_user else None
                 user_name = user.name if user else f"Unknown({user_id})"
             except Exception:
                 user_name = f"Unknown({user_id})"
@@ -187,8 +192,7 @@ class DMNProcessor:
                 user_id, seed_memory = selection_result
             
             try:
-                user = await self.bot.fetch_user(int(user_id))
-                user_name = user.name if user else "Unknown User"
+                user_name = await self.runtime.resolve_user(user_id)
             except Exception:
                 user_name = "Unknown User"
             # Run memory search in executor to prevent blocking
@@ -217,13 +221,13 @@ class DMNProcessor:
                 self._cleanup_disconnected_memories()
                 return
             self.logger.info(f"dmn.orphan detected—delegating to spike")
-            if hasattr(self.bot, 'spike_processor') and self.bot.spike_processor:
+            if self.runtime.spike_processor:
                 from spike import handle_orphaned_memory
-                fired = await handle_orphaned_memory(self.bot.spike_processor, seed_memory)
+                fired = await handle_orphaned_memory(self.runtime.spike_processor, seed_memory)
                 if fired:
                     # Queue under bot's own user_id so the next search finds the spike
                     # interaction memory (stored under bot.user.id, not the original user)
-                    bot_uid = str(self.bot.user.id) if self.bot.user else user_id
+                    bot_uid = self.runtime.agent_id
                     self.logger.info(f"spike.fired from dmn orphan—queuing under bot_uid={bot_uid} for dmn reprocessing")
                     self.pending_seeds.append((bot_uid, seed_memory))
                     self._cleanup_disconnected_memories()
@@ -371,12 +375,12 @@ class DMNProcessor:
         self.amygdala_response=new_intensity
         intensity_norm=new_intensity/100.0
         self.temperature=0.3+intensity_norm
-        self.bot.amygdala_response=new_intensity
+        self.runtime.amygdala_response=new_intensity
         # Convert intensity to temperature before passing to API client
-        self.bot.update_api_temperature(self.temperature)
+        self.runtime.update_api_temperature(self.temperature)
 
         top_p_value=0.98 if density<.33 else 0.95 if density<.66 else 0.92
-        self.bot.update_api_top_p(top_p_value)
+        self.runtime.update_api_top_p(top_p_value)
 
         self.logger.info(f"Updated bot amygdala arousal to {new_intensity} based on memory density")
         self.logger.info(f"Updated bot top_p to {top_p_value:.2f} (banded density mapping)")
@@ -408,7 +412,14 @@ class DMNProcessor:
                 if self.dmn_model:
                     api_kwargs['model_override'] = self.dmn_model
 
-                new_thought = await self.bot.call_api(**api_kwargs)
+                new_thought = await self.runtime.call_api(**api_kwargs)
+                new_thought, thinking_traces = separate_thinking_traces(new_thought)
+                await store_thinking_traces(
+                    self.memory_index,
+                    user_id,
+                    user_name,
+                    thinking_traces,
+                )
                 new_thought = clean_response(new_thought)
             
             # Gather unique users from related memories
@@ -418,9 +429,9 @@ class DMNProcessor:
                 memory_user_id = next((uid for uid, mems in self.memory_index.user_memories.items() if memory_id in mems), None)
                 if memory_user_id:
                     try:
-                        memory_user = await self.bot.fetch_user(int(memory_user_id))
-                        if memory_user and memory_user.name != user_name:
-                            memory_users.add(memory_user.name)
+                        resolved = await self.runtime.resolve_user(memory_user_id)
+                        if resolved != user_name:
+                            memory_users.add(resolved)
                     except Exception:
                         continue
             
