@@ -47,10 +47,24 @@ HARSH_TRUNCATION_LENGTH = config.conversation.harsh_truncation_length
 MEMORY_CAPACITY = config.persona.memory_capacity
 ALLOWED_EXTENSIONS = config.files.allowed_extensions
 ALLOWED_IMAGE_EXTENSIONS = config.files.allowed_image_extensions
+ALLOWED_AUDIO_EXTENSIONS = config.files.allowed_audio_extensions
+ALLOWED_VIDEO_EXTENSIONS = config.files.allowed_video_extensions
 
 
 def _currentmoment() -> str:
     return datetime.now().strftime("%H:%M [%d/%m/%y]")
+
+
+def _fallback_prompt(kind: str, *, context: str, filename: str, user_message: str, user_name: str,
+                     text_files: str = "", image_files: str = "", audio_files: str = "", video_files: str = "") -> str:
+    if kind == "audio":
+        return f"{context}\nAudio files: {filename}\n@{user_name}: {user_message or 'Please analyze this audio.'}"
+    if kind == "video":
+        return f"{context}\nVideo files: {filename}\n@{user_name}: {user_message or 'Please analyze this video.'}"
+    return (
+        f"{context}\nImages:\n{image_files}\nAudio:\n{audio_files}\nVideo:\n{video_files}\n"
+        f"Text files:\n{text_files}\n@{user_name}: {user_message or 'Please analyze these files.'}"
+    )
 
 
 def _themes_memoized(memory_index, user_id: str, mode: str = "sections") -> str:
@@ -335,9 +349,16 @@ async def process_files(
     ]
 
     image_files: List[str] = []
+    audio_files: List[str] = []
+    video_files: List[str] = []
     text_contents: List[dict] = []
     temp_paths: List[str] = []
+    audio_paths: List[str] = []
+    video_frame_paths: List[str] = []
+    media_source_paths: List[str] = []
     has_images = False
+    has_audio = False
+    has_video = False
     has_text = False
 
     try:
@@ -350,13 +371,25 @@ async def process_files(
                 and att.content_type.startswith("image/")
                 and ext in ALLOWED_IMAGE_EXTENSIONS
             )
+            is_potentially_audio = (
+                ext in ALLOWED_AUDIO_EXTENSIONS
+                or (att.content_type and att.content_type.startswith("audio/"))
+            )
+            is_potentially_video = (
+                ext in ALLOWED_VIDEO_EXTENSIONS
+                or (att.content_type and att.content_type.startswith("video/"))
+            )
             is_potentially_text = ext in ALLOWED_EXTENSIONS
             data_to_save = None
             processed_as_image = False
+            processed_as_audio = False
+            processed_as_video = False
             processed_as_text = False
 
             if att.size > 1_000_000:
-                if is_potentially_image:
+                if is_potentially_audio or is_potentially_video:
+                    pass
+                elif is_potentially_image:
                     try:
                         from PIL import Image
                         import io
@@ -399,7 +432,7 @@ async def process_files(
                         f"Skipping {att.filename} - file is over 1MB and not a resizable image.",
                     )
                     continue
-            else:
+            if not data_to_save and not (processed_as_image or processed_as_text):
                 if is_potentially_image:
                     try:
                         from PIL import Image
@@ -417,6 +450,20 @@ async def process_files(
                             )
                     except Exception as e:
                         runtime.logger.error(f"Error processing small image {att.filename}: {str(e)}")
+                        continue
+                elif is_potentially_audio:
+                    try:
+                        data_to_save = await att.read()
+                        processed_as_audio = True
+                    except Exception as e:
+                        runtime.logger.error(f"Error reading audio {att.filename}: {str(e)}")
+                        continue
+                elif is_potentially_video:
+                    try:
+                        data_to_save = await att.read()
+                        processed_as_video = True
+                    except Exception as e:
+                        runtime.logger.error(f"Error reading video {att.filename}: {str(e)}")
                         continue
                 elif is_potentially_text:
                     try:
@@ -441,7 +488,7 @@ async def process_files(
                     await adapter.send(
                         msg.channel_id,
                         f"Skipping {att.filename} - unsupported type. "
-                        f"Supported: {', '.join(ALLOWED_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS)}",
+                        f"Supported: {', '.join(ALLOWED_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS | ALLOWED_AUDIO_EXTENSIONS | ALLOWED_VIDEO_EXTENSIONS)}",
                     )
                     continue
 
@@ -464,6 +511,16 @@ async def process_files(
                     continue
             elif processed_as_text:
                 has_text = True
+            elif processed_as_audio and data_to_save and cache:
+                src_path, _ = cache.create_temp_file(user_id=user_id, prefix="audio_src_", suffix=ext, content=data_to_save)
+                media_source_paths.append(src_path)
+                out_path = await _compress_audio(src_path, cache, user_id, att.filename)
+                audio_files.append(att.filename); audio_paths.append(out_path); has_audio = True
+            elif processed_as_video and data_to_save and cache:
+                src_path, _ = cache.create_temp_file(user_id=user_id, prefix="video_src_", suffix=ext, content=data_to_save)
+                media_source_paths.append(src_path)
+                frames = await _compress_video(src_path, cache, user_id, att.filename)
+                video_files.append(att.filename); video_frame_paths.extend(frames); has_video = True
 
         history_result = await history_task
         history_msgs, reactions_map = history_result
@@ -492,7 +549,7 @@ async def process_files(
                     f"Error scraping URL {data['url']}: {data.get('description', 'Unknown error')}",
                 )
 
-        if not (has_images or has_text):
+        if not (has_images or has_audio or has_video or has_text):
             await adapter.send(msg.channel_id, "No valid files found to analyze after processing.")
             return
 
@@ -509,18 +566,27 @@ async def process_files(
         amygdala = str(runtime.amygdala_response)
         themes = ", ".join(_themes_memoized(memory_index, user_id, mode="just_user").split())
 
-        if has_images and has_text:
+        media_count = sum(bool(x) for x in (has_images, has_audio, has_video, has_text))
+        if media_count > 1:
             if "analyze_combined" not in prompt_formats or "combined_analysis" not in system_prompts:
                 raise ValueError("Missing required combined analysis prompts")
-            prompt = prompt_formats["analyze_combined"].format(
+            prompt_tpl = prompt_formats.get("analyze_combined")
+            prompt = prompt_tpl.format(
                 context=context,
                 image_files="\n".join(image_files),
+                audio_files="\n".join(audio_files),
+                video_files="\n".join(video_files),
                 text_files="\n".join(
                     f"{t['filename']}: {truncate_middle(t['content'], 1000)}"
                     for t in text_contents
                 ),
                 user_message=user_message or "Please analyze these files.",
                 user_name=user_name,
+            ) if prompt_tpl else _fallback_prompt(
+                "combined", context=context, image_files="\n".join(image_files),
+                audio_files="\n".join(audio_files), video_files="\n".join(video_files),
+                text_files="\n".join(f"{t['filename']}: {truncate_middle(t['content'], 1000)}" for t in text_contents),
+                filename="", user_message=user_message, user_name=user_name
             )
             system_prompt = (
                 system_prompts["combined_analysis"]
@@ -538,6 +604,32 @@ async def process_files(
             )
             system_prompt = (
                 system_prompts["image_analysis"]
+                .replace("{amygdala_response}", amygdala)
+                .replace("{themes}", themes)
+            )
+        elif has_audio:
+            prompt_tpl = prompt_formats.get("analyze_audio")
+            prompt = prompt_tpl.format(
+                context=context,
+                filename=", ".join(audio_files),
+                user_message=user_message or "Please analyze this audio.",
+                user_name=user_name,
+            ) if prompt_tpl else _fallback_prompt("audio", context=context, filename=", ".join(audio_files), user_message=user_message, user_name=user_name)
+            system_prompt = (
+                system_prompts.get("audio_analysis", system_prompts["combined_analysis"])
+                .replace("{amygdala_response}", amygdala)
+                .replace("{themes}", themes)
+            )
+        elif has_video:
+            prompt_tpl = prompt_formats.get("analyze_video")
+            prompt = prompt_tpl.format(
+                context=context,
+                filename=", ".join(video_files),
+                user_message=user_message or "Please analyze this video.",
+                user_name=user_name,
+            ) if prompt_tpl else _fallback_prompt("video", context=context, filename=", ".join(video_files), user_message=user_message, user_name=user_name)
+            system_prompt = (
+                system_prompts.get("video_analysis", system_prompts["combined_analysis"])
                 .replace("{amygdala_response}", amygdala)
                 .replace("{themes}", themes)
             )
@@ -565,7 +657,8 @@ async def process_files(
             response_content = await runtime.call_api(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                image_paths=temp_paths if temp_paths else None,
+                image_paths=(temp_paths + video_frame_paths) if (temp_paths or video_frame_paths) else None,
+                audio_paths=audio_paths if audio_paths else None,
                 temperature=runtime.amygdala_response / 100,
             )
             response_content, thinking_traces = separate_thinking_traces(response_content)
@@ -584,6 +677,10 @@ async def process_files(
             files_desc = []
             if image_files:
                 files_desc.append(f"{len(image_files)} images: {', '.join(image_files)}")
+            if audio_files:
+                files_desc.append(f"{len(audio_files)} audio files: {', '.join(audio_files)}")
+            if video_files:
+                files_desc.append(f"{len(video_files)} videos: {', '.join(video_files)}")
             if text_contents:
                 files_desc.append(
                     f"{len(text_contents)} text files: "
@@ -610,8 +707,12 @@ async def process_files(
                     )
             if image_files:
                 file_context += f"Images analyzed: {', '.join(image_files)}\n"
+            if audio_files:
+                file_context += f"Audio analyzed: {', '.join(audio_files)}\n"
+            if video_files:
+                file_context += f"Video analyzed as frames: {', '.join(video_files)}\n"
 
-            paths_to_cleanup = list(temp_paths)
+            paths_to_cleanup = list(temp_paths) + list(audio_paths) + list(video_frame_paths) + list(media_source_paths)
 
             def _cleanup():
                 for p in paths_to_cleanup:
@@ -634,7 +735,8 @@ async def process_files(
                     system_prompts=system_prompts,
                     runtime=runtime,
                     file_context=file_context,
-                    image_paths=temp_paths if temp_paths else None,
+                    image_paths=(temp_paths + video_frame_paths) if (temp_paths or video_frame_paths) else None,
+                    audio_paths=audio_paths if audio_paths else None,
                     cleanup_callback=_cleanup,
                 )
             )
@@ -646,6 +748,8 @@ async def process_files(
                 "user_name": user_name,
                 "files_processed": {
                     "images": image_files,
+                    "audio": audio_files,
+                    "video": video_files,
                     "text_files": [t["filename"] for t in text_contents],
                 },
                 "user_message": user_message,
@@ -668,6 +772,7 @@ async def generate_and_save_thought(
     runtime: AgentRuntime,
     file_context: str = "",
     image_paths: Optional[List[str]] = None,
+    audio_paths: Optional[List[str]] = None,
     cleanup_callback=None,
     conversation_context: str = "",
 ) -> None:
@@ -709,6 +814,7 @@ async def generate_and_save_thought(
         context="",
         system_prompt=thought_system_prompt,
         image_paths=image_paths,
+        audio_paths=audio_paths,
         temperature=runtime.amygdala_response / 100,
     )
     thought_response, thinking_traces = separate_thinking_traces(thought_response)
@@ -739,6 +845,54 @@ async def generate_and_save_thought(
 # Private helpers                                                     #
 # ------------------------------------------------------------------ #
 
+async def _run_media_command(args: List[str], logger=None) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace")[-500:]
+        if logger:
+            logger.error(f"media.compress.err cmd={args[0]} msg={detail}")
+        raise RuntimeError(detail or f"{args[0]} exited with {proc.returncode}")
+
+
+async def _compress_audio(src_path: str, cache, user_id: str, filename: str) -> str:
+    out_dir = cache.get_user_temp_dir(user_id)
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(filename)[0])[:80] or "audio"
+    out_path = os.path.join(out_dir, f"audio_{stem}.wav")
+    await _run_media_command([
+        "ffmpeg", "-y",
+        "-i", src_path,
+        "-t", str(config.files.audio_max_seconds),
+        "-ac", "1",
+        "-ar", "16000",
+        "-vn",
+        out_path,
+    ], getattr(cache, "logger", None))
+    return out_path
+
+
+async def _compress_video(src_path: str, cache, user_id: str, filename: str) -> List[str]:
+    out_dir = cache.get_user_temp_dir(user_id)
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(filename)[0])[:80] or "video"
+    pattern = os.path.join(out_dir, f"video_{stem}_%03d.jpg")
+    await _run_media_command([
+        "ffmpeg", "-y",
+        "-i", src_path,
+        "-t", str(config.files.video_max_seconds),
+        "-vf", f"fps={config.files.video_frame_rate},scale=640:-2:force_original_aspect_ratio=decrease",
+        "-q:v", "4",
+        pattern,
+    ], getattr(cache, "logger", None))
+    return sorted(
+        os.path.join(out_dir, f)
+        for f in os.listdir(out_dir)
+        if f.startswith(f"video_{stem}_") and f.endswith(".jpg")
+    )
+
 def _has_supported_files(attachments: List) -> bool:
     for att in attachments:
         ext = os.path.splitext(att.filename.lower())[1]
@@ -746,6 +900,8 @@ def _has_supported_files(attachments: List) -> bool:
             att.content_type
             and att.content_type.startswith("image/")
             and ext in ALLOWED_IMAGE_EXTENSIONS
+        ) or ext in ALLOWED_AUDIO_EXTENSIONS or ext in ALLOWED_VIDEO_EXTENSIONS or (
+            att.content_type and (att.content_type.startswith("audio/") or att.content_type.startswith("video/"))
         ):
             return True
     return False

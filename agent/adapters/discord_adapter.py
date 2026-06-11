@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import discord
 
 from .base import NormalizedAttachment, NormalizedMessage, PlatformAdapter
+from bot_config import config
 from context import fetch_history_with_reactions
 from discord_utils import format_discord_mentions, sanitize_mentions
 from chunker import balance_wraps
@@ -99,7 +100,13 @@ class DiscordAdapter(PlatformAdapter):
                 reply_attachments = []
                 for att in original.attachments:
                     ext = os.path.splitext(att.filename.lower())[1]
-                    if (att.content_type and att.content_type.startswith("image/")) or ext in {".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".csv"}:
+                    allowed = (
+                        config.files.allowed_extensions
+                        | config.files.allowed_image_extensions
+                        | config.files.allowed_audio_extensions
+                        | config.files.allowed_video_extensions
+                    )
+                    if ext in allowed or (att.content_type and att.content_type.startswith("image/")):
                         reply_attachments.append(self._wrap_attachment(att))
 
                 reply_to = NormalizedMessage(

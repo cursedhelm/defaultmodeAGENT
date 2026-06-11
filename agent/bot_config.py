@@ -36,12 +36,17 @@ class APIConfig(BaseModel):
 class FileConfig(BaseModel):
     allowed_extensions: Set[str] = Field(default={'.py','.js','.html','.css','.json','.md','.txt'})
     allowed_image_extensions: Set[str] = Field(default={'.jpg','.jpeg','.png','.gif','.bmp'})
+    allowed_audio_extensions: Set[str] = Field(default={'.mp3','.wav','.m4a','.ogg','.flac'})
+    allowed_video_extensions: Set[str] = Field(default={'.mp4','.mov','.webm','.mkv'})
 
     # single source of truth
     text_ingestion_mode: str = Field(default="hybrid")
     truncate_length: int = Field(default=8000)
     chronpress_threshold: int = Field(default=16000)
     chronpress_target_chars: int = Field(default=8000)
+    audio_max_seconds: int = Field(default=30)
+    video_max_seconds: int = Field(default=60)
+    video_frame_rate: int = Field(default=1)
 
 
 class SearchConfig(BaseModel):
