@@ -48,7 +48,7 @@ class PlatformAdapter(ABC):
     Contract between the platform-agnostic agent core and a specific chat platform.
 
     Implement all abstract methods for each new platform.  The Discord
-    implementation lives in platform/discord_adapter.py.
+    implementation lives in adapters/discord_adapter.py.
     """
 
     # ------------------------------------------------------------------ #

@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import discord
+from pydantic import BaseModel, Field
 
 from .base import NormalizedAttachment, NormalizedMessage, PlatformAdapter
 from bot_config import config
@@ -21,6 +22,24 @@ from chunker import balance_wraps
 
 if TYPE_CHECKING:
     from discord.ext import commands
+
+
+class DiscordAdapterPrompts(BaseModel):
+    """Hardcoded prompt strings this adapter injects into LLM context.
+
+    The context headers implement format_context_header (how the agent
+    perceives where it is); the reply template is how a Discord reply chain
+    is rendered into the message content the LLM sees.
+    """
+    dm_context_header: str = Field(default="Current channel: Direct Message\n")
+    guild_context_header: str = Field(default="Current Discord server: {guild_name}, channel: #{channel_name}\n")
+    reply_context: str = Field(default=(
+        "[@{author} replying to @{original_author}'s message: {original_content}]"
+        "\n\n@{author}: {content}"
+    ))
+
+
+PROMPTS = DiscordAdapterPrompts()
 
 
 class DiscordAdapter(PlatformAdapter):
@@ -126,10 +145,11 @@ class DiscordAdapter(PlatformAdapter):
                 # Augment content to give the LLM reply context (preserves
                 # the same string the old extract_content_and_reply produced)
                 if original_content:
-                    content = (
-                        f"[@{message.author.name} replying to "
-                        f"@{original.author.name}'s message: {original_content}]"
-                        f"\n\n@{message.author.name}: {content}"
+                    content = PROMPTS.reply_context.format(
+                        author=message.author.name,
+                        original_author=original.author.name,
+                        original_content=original_content,
+                        content=content,
                     )
             except (discord.NotFound, discord.Forbidden):
                 pass
@@ -214,8 +234,8 @@ class DiscordAdapter(PlatformAdapter):
 
     def format_context_header(self, msg: NormalizedMessage) -> str:
         if msg.is_dm:
-            return "Current channel: Direct Message\n"
-        return f"Current Discord server: {msg.guild_name}, channel: #{msg.channel_name}\n"
+            return PROMPTS.dm_context_header
+        return PROMPTS.guild_context_header.format(guild_name=msg.guild_name, channel_name=msg.channel_name)
 
     def format_response(self, response: str, msg: NormalizedMessage) -> str:
         guild = msg.raw.guild if msg.raw else None

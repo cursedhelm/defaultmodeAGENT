@@ -7,11 +7,33 @@ so spike can't import discord_bot). Both pipelines now get identical context for
 
 import re
 from datetime import datetime
+from pydantic import BaseModel, Field
 from temporality import TemporalParser
 from chunker import truncate_middle
 from discord_utils import sanitize_mentions
 from hippocampus import Hippocampus, HippocampusConfig
 from bot_config import config
+
+
+class ContextPrompts(BaseModel):
+    """Hardcoded prompt scaffolding — the fixed frame every persona prompt sees.
+
+    These strings are the interface contract between the code and the YAML
+    persona prompts: the tags and headers here are what a system prompt can
+    reliably refer to ("the conversation", "your memories").
+    """
+    simple_message_line: str = Field(default="@{name}: {content}")
+    message_line: str = Field(default="@{name} ({temporal}): {content}")
+    reaction_entry: str = Field(default="@{user}: {emoji}")
+    reactions_suffix: str = Field(default="\n(Reactions: {reactions})")
+    memory_block_header: str = Field(default="{count} Potentially Relevant Memories:\n<memories>\n")
+    memory_entry: str = Field(default="[Relevance: {score:.2f}] {memory}\n")
+    memory_block_footer: str = Field(default="</memories>\n\n")
+    conversation_block_header: str = Field(default="**Ongoing Channel Conversation:**\n\n<conversation>\n")
+    conversation_block_footer: str = Field(default="</conversation>\n")
+
+
+PROMPTS = ContextPrompts()
 
 
 async def fetch_history_with_reactions(channel, limit, skip_id=None):
@@ -42,19 +64,19 @@ def process_history_dual(msgs, reactions_map, temporal_parser, truncation_len, h
         name = msg.author.name
         mentions = list(msg.mentions) + list(msg.channel_mentions) + list(msg.role_mentions)
         sanitized = sanitize_mentions(msg.content, mentions)
-        simple_lines.append(f"@{name}: {sanitized}")
+        simple_lines.append(PROMPTS.simple_message_line.format(name=name, content=sanitized))
         truncated = truncate_middle(sanitized, max_tokens=trunc_len)
         local_ts = msg.created_at.astimezone().replace(tzinfo=None)
         ts_str = local_ts.strftime("%H:%M [%d/%m/%y]")
         temporal = temporal_parser.get_temporal_expression(ts_str)
-        formatted = f"@{name} ({temporal.base_expression}): {truncated}"
+        formatted = PROMPTS.message_line.format(name=name, temporal=temporal.base_expression, content=truncated)
 
         # look up reactions from separate map
         msg_reactions = reactions_map.get(msg.id, {})
         if msg_reactions:
-            rxn_parts = [f"@{u}: {emoji}" for emoji, users in msg_reactions.items() for u in users]
+            rxn_parts = [PROMPTS.reaction_entry.format(user=u, emoji=emoji) for emoji, users in msg_reactions.items() for u in users]
             if rxn_parts:
-                formatted += f"\n(Reactions: {' '.join(rxn_parts)})"
+                formatted += PROMPTS.reactions_suffix.format(reactions=' '.join(rxn_parts))
 
         formatted_list.append(formatted)
 
@@ -67,7 +89,7 @@ def build_memory_context(relevant_memories, temporal_parser, truncation_len):
     """format memories with temporal parsing"""
     if not relevant_memories:
         return ""
-    ctx = f"{len(relevant_memories)} Potentially Relevant Memories:\n<memories>\n"
+    ctx = PROMPTS.memory_block_header.format(count=len(relevant_memories))
     timestamp_pattern = r'\((\d{2}):(\d{2})\s*\[(\d{2}/\d{2}/\d{2})\]\)'
     for memory, score in relevant_memories:
         parsed = re.sub(
@@ -76,17 +98,17 @@ def build_memory_context(relevant_memories, temporal_parser, truncation_len):
             memory
         )
         truncated = truncate_middle(parsed, max_tokens=truncation_len)
-        ctx += f"[Relevance: {score:.2f}] {truncated}\n"
-    ctx += "</memories>\n\n"
+        ctx += PROMPTS.memory_entry.format(score=score, memory=truncated)
+    ctx += PROMPTS.memory_block_footer
     return ctx
 
 
 def build_conversation_context(formatted_msgs):
     """wrap formatted messages in conversation tags"""
-    ctx = "**Ongoing Channel Conversation:**\n\n<conversation>\n"
+    ctx = PROMPTS.conversation_block_header
     for msg in formatted_msgs:
         ctx += f"{msg}\n"
-    ctx += "</conversation>\n"
+    ctx += PROMPTS.conversation_block_footer
     return ctx
 
 

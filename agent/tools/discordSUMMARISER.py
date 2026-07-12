@@ -2,9 +2,35 @@ import sys
 import os
 
 from collections import defaultdict
+
+from pydantic import BaseModel, Field
+
 from discord_utils import sanitize_mentions, format_discord_mentions
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class SummaryPrompts(BaseModel):
+    """Hardcoded skeleton of the channel summary report.
+
+    Only the content summary is LLM-generated (via the YAML summarize_channel /
+    channel_summarization prompts); the stats sections are deterministic.
+    """
+    channel_header: str = Field(default="Summary of #{channel_name}:\n\n")
+    main_section: str = Field(default="Main Channel")
+    thread_section: str = Field(default="Thread: {thread_name}")
+    section_header: str = Field(default="{context}\n")
+    participants_header: str = Field(default="Participants:\n")
+    participant_line: str = Field(default="- {user}: {count} messages\n")
+    files_header: str = Field(default="\nShared Files:\n")
+    file_line: str = Field(default="- {file_type}: {count} files\n")
+    content_summary: str = Field(default="\nContent Summary:\n{content}\n")
+    message_chunk: str = Field(default="{name}: {content}")
+    error_summary: str = Field(default="Error in generating summary: {error}")
+
+
+PROMPTS = SummaryPrompts()
+
 
 # Channel summarization
 class ChannelSummarizer:
@@ -60,13 +86,13 @@ class ChannelSummarizer:
             else:
                 main_messages.append(message)
 
-        summary = f"Summary of #{channel.name}:\n\n"
-        summary += await self._summarize_messages(main_messages, "Main Channel")
+        summary = PROMPTS.channel_header.format(channel_name=channel.name)
+        summary += await self._summarize_messages(main_messages, PROMPTS.main_section)
 
         for thread_id, thread_messages in threads.items():
             thread = channel.get_thread(thread_id)
             if thread:
-                thread_summary = await self._summarize_messages(thread_messages, f"Thread: {thread.name}")
+                thread_summary = await self._summarize_messages(thread_messages, PROMPTS.thread_section.format(thread_name=thread.name))
                 summary += f"\n{thread_summary}"
 
         return summary
@@ -102,20 +128,20 @@ class ChannelSummarizer:
             )
             
             # Add the sanitized message to chunks with author's display name
-            content_chunks.append(f"{message.author.display_name}: {sanitized_content}")
+            content_chunks.append(PROMPTS.message_chunk.format(name=message.author.display_name, content=sanitized_content))
 
-        summary = f"{context}\n"
-        summary += "Participants:\n"
+        summary = PROMPTS.section_header.format(context=context)
+        summary += PROMPTS.participants_header
         for user, count in user_message_counts.items():
-            summary += f"- {user}: {count} messages\n"
+            summary += PROMPTS.participant_line.format(user=user, count=count)
 
         if file_types:
-            summary += "\nShared Files:\n"
+            summary += PROMPTS.files_header
             for file_type, count in file_types.items():
-                summary += f"- {file_type}: {count} files\n"
+                summary += PROMPTS.file_line.format(file_type=file_type, count=count)
 
         content_summary = await self._process_chunks(content_chunks, context)
-        summary += f"\nContent Summary:\n{content_summary}\n"
+        summary += PROMPTS.content_summary.format(content=content_summary)
 
         return summary
 
@@ -143,4 +169,4 @@ class ChannelSummarizer:
         try:
             return await self.bot.call_api(prompt, context="", system_prompt=system_prompt, temperature=self.bot.amygdala_response/100)
         except Exception as e:
-            return f"Error in generating summary: {str(e)}"
+            return PROMPTS.error_summary.format(error=str(e))

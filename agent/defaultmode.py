@@ -4,6 +4,7 @@ from collections import defaultdict
 import logging
 from datetime import datetime
 import re
+from pydantic import BaseModel, Field
 from chunker import truncate_middle, clean_response
 from temporality import TemporalParser
 from thinking_trace import separate_thinking_traces, store_thinking_traces
@@ -12,6 +13,28 @@ try:
     from tools.chronpression import chronomic_filter as _chronomic_filter
 except ImportError:
     _chronomic_filter = None
+
+
+class DMNPrompts(BaseModel):
+    """Hardcoded prompt scaffolding for DMN thought generation.
+
+    The thought_memory template is load-bearing: its prefix ("Reflections/
+    Distillation on priors with @...") is how DMN thoughts identify themselves
+    when they resurface in prompts, and spike.extract_memory_content splits on
+    ':\\n' to strip it. The instruction prompts live in the bot's YAML
+    (generate_dmn_thought / dmn_thought_generation).
+    """
+    connected_memories_header: str = Field(default="{count} Connected memories:\n\n")
+    memory_entry: str = Field(default="{memory} [Weight: {score:.2f}]\n\n")
+    empty_recall: str = Field(default="Hmmm... nothing comes to mind.\n")
+    llm_label: str = Field(default="Reflections")
+    chronpression_label: str = Field(default="Distillation")
+    users_suffix: str = Field(default=" and {users}")
+    thought_memory: str = Field(default="{label} on priors with @{name}{users} {timestamp}:\n{thought}")
+
+
+PROMPTS = DMNPrompts()
+
 
 class DMNProcessor:
     """
@@ -56,6 +79,9 @@ class DMNProcessor:
         self.chron_compression_max = dmn_config.chron_compression_max
         # Search similarity settings
         self.similarity_threshold = dmn_config.similarity_threshold
+        # Neighbour thinning probability bounds
+        self.thin_p_min = dmn_config.thin_p_min
+        self.thin_p_max = dmn_config.thin_p_max
         # Store modes from config
         self.modes = dmn_config.modes
         # Set initial mode
@@ -153,25 +179,25 @@ class DMNProcessor:
         for pl in self.memory_index.inverted_index.values():
             for mid in pl:
                 tf_totals[mid] += 1
+        # Build (mid, text, weight) triples for user's memories
         weighted_memories = [
-            (self.memory_index.memories[memory_id],
+            (memory_id, self.memory_index.memories[memory_id],
              max(1, tf_totals.get(memory_id, 1)))
             for memory_id in user_memories
             if self.memory_index.memories[memory_id] is not None
         ]
         if not weighted_memories:
             return None
-        total_weight = sum(weight for _, weight in weighted_memories)
+        total_weight = sum(w for _, _, w in weighted_memories)
         if total_weight <= 0:
             return None
         # Random selection based on weights
         selection_point = random.uniform(0, total_weight)
         current_weight = 0
-        
-        for memory, weight in weighted_memories:
+        for memory_id, memory, weight in weighted_memories:
             current_weight += weight
             if current_weight >= selection_point:
-                return selected_user_id, memory
+                return selected_user_id, memory_id, memory
 
         return None
 
@@ -181,15 +207,15 @@ class DMNProcessor:
         from_pending = False
         for attempt in range(max_retries):
             if self.pending_seeds and attempt == 0:
-                user_id, seed_memory = self.pending_seeds.pop(0)
+                user_id, seed_mid, seed_memory = self.pending_seeds.pop(0)
                 from_pending = True
-                self.logger.info(f"dmn.pending_seed consumed user={user_id} memory={seed_memory[:80]}")
+                self.logger.info(f"dmn.pending_seed consumed user={user_id} mid={seed_mid} memory={seed_memory[:80]}")
             else:
                 from_pending = False
                 selection_result = self._select_random_memory()
                 if not selection_result:
                     return
-                user_id, seed_memory = selection_result
+                user_id, seed_mid, seed_memory = selection_result
             
             try:
                 user_name = await self.runtime.resolve_user(user_id)
@@ -229,7 +255,9 @@ class DMNProcessor:
                     # interaction memory (stored under bot.user.id, not the original user)
                     bot_uid = self.runtime.agent_id
                     self.logger.info(f"spike.fired from dmn orphan—queuing under bot_uid={bot_uid} for dmn reprocessing")
-                    self.pending_seeds.append((bot_uid, seed_memory))
+                    entry = (bot_uid, seed_mid, seed_memory)
+                    if entry not in self.pending_seeds:
+                        self.pending_seeds.append(entry)
                     self._cleanup_disconnected_memories()
                     return
                 else:
@@ -252,7 +280,7 @@ class DMNProcessor:
         })
 
         # Build memory context using ALL related memories
-        memory_context = f"{len(related_memories)} Connected memories:\n\n"
+        memory_context = PROMPTS.connected_memories_header.format(count=len(related_memories))
         if related_memories:
             for memory, score in sorted(related_memories, key=lambda x: x[1], reverse=True):
                 # Convert any timestamp in the memory to temporal expression
@@ -261,9 +289,9 @@ class DMNProcessor:
                 parsed_memory = re.sub(timestamp_pattern, 
                     lambda m: f"({self.temporal_parser.get_temporal_expression(datetime.strptime(f'{m.group(1)}:{m.group(2)} {m.group(3)}', '%H:%M %d/%m/%y')).base_expression})", 
                     memory)
-                memory_context += f"{parsed_memory} [Weight: {score:.2f}]\n\n"
+                memory_context += PROMPTS.memory_entry.format(memory=parsed_memory, score=score)
         else:
-            memory_context += "Hmmm... nothing comes to mind.\n"
+            memory_context += PROMPTS.empty_recall
 
         # Get high-similarity memories for term processing
         similar_memories = []
@@ -287,12 +315,19 @@ class DMNProcessor:
                 'combination_threshold': self.combination_threshold,
                 'memory_context': memory_context
             })
-            # Get memory IDs for memories
-            seed_memory_id = self.memory_index.memories.index(seed_memory)
-            top_memories = [(seed_memory, seed_memory_id)] + [
-                (memory, self.memory_index.memories.index(memory))
-                for memory, _ in similar_memories[1:]
-            ]
+            # Resolve mids once, before any await, under the lock to guard against reload races.
+            # Use the carried seed_mid (fix 6) — only fall back to index() for neighbours.
+            seed_memory_id = seed_mid
+            score_by_mid = {}
+            top_memories = [(seed_memory, seed_memory_id)]
+            with self.memory_index._mut:
+                for memory, s in similar_memories[1:]:
+                    try:
+                        mid = self.memory_index.memories.index(memory)
+                    except ValueError:
+                        continue
+                    top_memories.append((memory, mid))
+                    score_by_mid[mid] = float(s)
             # Find overlapping terms between seed and each result
             memory_terms_map = {}
             for memory, memory_id in top_memories:
@@ -333,7 +368,8 @@ class DMNProcessor:
                     'user_id': user_id,
                     'top_memories': top_memories,
                     'memory_terms_map': memory_terms_map,
-                    'overlapping_terms': overlapping_terms
+                    'overlapping_terms': overlapping_terms,
+                    'score_by_mid': score_by_mid,
                 }
 
         # Replace timestamp generation with temporal expression
@@ -374,7 +410,7 @@ class DMNProcessor:
         # intensity already computed above as new_intensity and density already computed
         self.amygdala_response=new_intensity
         intensity_norm=new_intensity/100.0
-        self.temperature=0.3+intensity_norm
+        self.temperature=0.3+0.7*intensity_norm  # range [0.3, 1.0] — matches provider ceiling
         self.runtime.amygdala_response=new_intensity
         # Convert intensity to temperature before passing to API client
         self.runtime.update_api_temperature(self.temperature)
@@ -437,63 +473,83 @@ class DMNProcessor:
             
             # Save generated thought as new memory
             timestamp = datetime.now().strftime('(%H:%M [%d/%m/%y])')
-            users_str = f" and {', '.join(memory_users)}" if memory_users else ""
+            users_str = PROMPTS.users_suffix.format(users=', '.join(memory_users)) if memory_users else ""
             # Clean username - remove all possible leading Discord role markers
             clean_name = re.sub(r'^[.!~*$]', '', user_name).strip()
-            label = "Distillation" if self.use_chronpression else "Reflections"
-            thought_memory = f"{label} on priors with @{clean_name}{users_str} {timestamp}:\n{new_thought}"
+            label = PROMPTS.chronpression_label if self.use_chronpression else PROMPTS.llm_label
+            thought_memory = PROMPTS.thought_memory.format(
+                label=label, name=clean_name, users=users_str,
+                timestamp=timestamp, thought=new_thought,
+            )
             # Store memory without metadata
             await self.memory_index.add_memory_async(user_id, thought_memory)
 
-            # Decay seed TF: remove one posting entry per term so weight decrements naturally.
-            # Bound by actual term count — hits zero only when all entries are gone,
-            # at which point _cleanup_disconnected_memories removes the memory entirely.
-            seed_mid = next(
-                (i for i, m in enumerate(self.memory_index.memories) if m == seed_memory), None
-            )
-            if seed_mid is not None:
+            # Probabilistic seed decay: each term entry removed with p=decay_rate.
+            # Expected visits to full disconnection ≈ ln(terms)/decay_rate (geometric survival).
+            # decay_rate=1.0 reproduces old single-visit behaviour; default ~0.25 gives gradual wear.
+            # Validate the carried seed_mid is still pointing at the right text (fix 6).
+            if (seed_mid is not None and
+                    seed_mid < len(self.memory_index.memories) and
+                    self.memory_index.memories[seed_mid] == seed_memory):
+                decayed = 0
                 with self.memory_index._mut:
                     for term in list(self.memory_index.inverted_index.keys()):
                         pl = self.memory_index.inverted_index[term]
-                        if seed_mid in pl:
+                        if seed_mid not in pl:
+                            continue
+                        if random.random() >= self.decay_rate:
+                            continue
+                        new_pl = list(pl)
+                        new_pl.remove(seed_mid)
+                        decayed += 1
+                        if new_pl:
+                            self.memory_index.inverted_index[term] = new_pl
+                        else:
+                            del self.memory_index.inverted_index[term]
+                self.memory_index._saver.request()
+                self.logger.info(f"dmn.seed_decay mid={seed_mid} p={self.decay_rate} terms_decayed={decayed}")
+            else:
+                self.logger.info(f"dmn.seed_decay skipped: mid={seed_mid} stale or missing")
+
+            # Similarity-graded neighbour thinning: close neighbours (high s) are thinned
+            # harder because their gist was just captured in the distillation child.
+            # Distant neighbours contributed novelty — their shared terms are the only bridge
+            # keeping them reachable, so we thin much more gently.
+            # p(remove one term entry) = thin_p_min + (thin_p_max - thin_p_min) * s
+            # Removal is tf-1 (single list.remove), never wholesale.
+            if 'memory_update_state' in locals():
+                state = memory_update_state
+                pmin = self.thin_p_min; pmax = self.thin_p_max
+                thinned = {}
+                with self.memory_index._mut:
+                    for memory, memory_id in state['top_memories'][1:]:
+                        # Stale-mid guard (fix 6): skip if index shifted under us
+                        if (memory_id >= len(self.memory_index.memories) or
+                                self.memory_index.memories[memory_id] != memory):
+                            continue
+                        s = state['score_by_mid'].get(memory_id, 0.0)
+                        p = pmin + (pmax - pmin) * max(0.0, min(1.0, s))
+                        shared = state['memory_terms_map'][memory_id] & state['overlapping_terms']
+                        removed = []
+                        for term in shared:
+                            if random.random() >= p:
+                                continue
+                            pl = self.memory_index.inverted_index.get(term)
+                            if not pl or memory_id not in pl:
+                                continue
                             new_pl = list(pl)
-                            new_pl.remove(seed_mid)  # removes one occurrence (TF -= 1)
+                            new_pl.remove(memory_id)
+                            removed.append(term)
                             if new_pl:
                                 self.memory_index.inverted_index[term] = new_pl
                             else:
                                 del self.memory_index.inverted_index[term]
-                self.memory_index._saver.request()
-                self.logger.info(f"dmn.seed_decay mid={seed_mid} tf decremented")
-
-            # Process memory weights and cleanup if we have memory state
-            if 'memory_update_state' in locals():
-                state = memory_update_state
-                affected_memories = []
-                # First remove overlapping terms
-                for memory, memory_id in state['top_memories'][1:]:  # Skip seed memory
-                    terms_removed = state['memory_terms_map'][memory_id] & state['overlapping_terms']
-                    remaining_terms = state['memory_terms_map'][memory_id] - state['overlapping_terms']
-                    if terms_removed:
-                        affected_memories.append((memory, terms_removed))
-                        self.logger.info(f"Memory [{memory_id}]: Removing terms: {', '.join(terms_removed)}")
-                        #self.logger.info(f"Memory [{memory_id}]: Remaining terms: {', '.join(remaining_terms)}")
-                        # Update inverted index directly
-                        with self.memory_index._mut:
-                            for term in terms_removed:
-                                if term in self.memory_index.inverted_index:
-                                    self.memory_index.inverted_index[term] = [
-                                        mid for mid in self.memory_index.inverted_index[term]
-                                        if mid != memory_id
-                                    ]
-                                    # Clean up empty terms
-                                    if not self.memory_index.inverted_index[term]:
-                                        del self.memory_index.inverted_index[term]
-                                        self.logger.info(f"Removed empty term entry: {term}")
-
-                # Term removal above already decrements TF for related memories — no separate weight update needed
-                #self.memory_index.save_cache()
-                self.memory_index._saver.request()
-                self.logger.info(f"Updated memory cache after pruning {len(affected_memories)} memories")
+                        if removed:
+                            thinned[memory_id] = {'score': round(s, 3), 'p': round(p, 3), 'terms': removed}
+                if thinned:
+                    self.memory_index._saver.request()
+                    self.logger.info(f"dmn.thin neighbours={len(thinned)}")
+                    self.logger.log({'event': 'dmn_neighbour_thinning', 'timestamp': datetime.now().isoformat(), 'thinned': {str(k): v for k, v in thinned.items()}})
 
             # Add cleanup here after new memory addition and weight updates
             self._cleanup_disconnected_memories()
@@ -526,38 +582,20 @@ class DMNProcessor:
     def _cleanup_disconnected_memories(self):
         with self.memory_index._mut:
             connected=set()
-            [connected.update(v) for v in self.memory_index.inverted_index.values()]
-            for uid,mems in list(self.memory_index.user_memories.items()):
-                disc=sorted([i for i in mems if i not in connected])
-                if not disc:
-                    continue
-                texts=[self.memory_index.memories[i] for i in disc]
-                removed=set(disc)
-                old_mem=self.memory_index.memories
-                self.memory_index.memories=[m for i,m in enumerate(old_mem) if i not in removed]
-                def remap(i):
-                    c=0
-                    for d in disc:
-                        if d<i:
-                            c+=1
-                        else:
-                            break
-                    return i-c
-                for u,ls in list(self.memory_index.user_memories.items()):
-                    new_ls=[remap(i) for i in ls if i not in removed]
-                    if new_ls:
-                        self.memory_index.user_memories[u]=new_ls
-                    else:
-                        self.memory_index.user_memories.pop(u,None)
-                for w,ls in list(self.memory_index.inverted_index.items()):
-                    nl=[remap(i) for i in ls if i not in removed]
-                    if nl:
-                        self.memory_index.inverted_index[w]=nl
-                    else:
-                        self.memory_index.inverted_index.pop(w,None)
-                self.logger.info(f"Cleaned up {len(disc)} disconnected memories for user {uid}")
-                self.logger.info(f"Disconnected memories: {texts}")
-                self.logger.log({'event':'dmn_memory_cleanup','timestamp':datetime.now().isoformat(),'user_id':uid,'disconnected_memories':texts})
+            for v in self.memory_index.inverted_index.values():connected.update(v)
+            disc=[i for i,m in enumerate(self.memory_index.memories) if m is not None and i not in connected]
+            if not disc:return
+            texts=[self.memory_index.memories[i] for i in disc]
+            owners={}
+            for uid,mems in self.memory_index.user_memories.items():
+                for mid in mems:
+                    if mid in connected:continue
+                    owners.setdefault(mid,uid)
+            for i in disc:self.memory_index.memories[i]=None
+            self.memory_index._compact()
+        self.memory_index._saver.request()
+        self.logger.info(f"dmn.cleanup removed={len(disc)}")
+        self.logger.log({'event':'dmn_memory_cleanup','timestamp':datetime.now().isoformat(),'removed':len(disc),'owners':{str(k):v for k,v in owners.items()},'disconnected_memories':texts})
 
 
     def set_mode(self, mode):
@@ -573,3 +611,5 @@ class DMNProcessor:
         self.top_k = int(p["top_k"])
         self.fuzzy_overlap_threshold = int(p["fuzzy_overlap_threshold"])
         self.fuzzy_search_threshold = int(p["fuzzy_search_threshold"])
+        self.thin_p_min = float(p.get("thin_p_min", self.thin_p_min))
+        self.thin_p_max = float(p.get("thin_p_max", self.thin_p_max))

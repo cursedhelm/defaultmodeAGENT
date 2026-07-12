@@ -60,6 +60,7 @@ PROVIDER_TOOL_STYLE = {
     "openai": "openai",
     "openrouter": "openai",
     "ollama": "openai",
+    "llama-server": "openai",
     "vllm": "openai",
     "unsloth": "openai",
     "anthropic": "anthropic",
@@ -121,6 +122,18 @@ def _with_v1_base(api_base: str | None) -> str:
     base = (api_base or "").rstrip("/")
     return base if base.endswith("/v1") else f"{base}/v1"
 
+def _openai_compat_base(provider: str, api_base: str | None) -> str | None:
+    if provider in ("ollama", "llama-server", "vllm", "unsloth"):
+        return _with_v1_base(api_base)
+    if provider == "openrouter":
+        return api_base
+    return None
+
+def _openai_compat_key(provider: str, api_key: str | None) -> str:
+    if provider in ("ollama", "llama-server"):
+        return api_key or provider
+    return api_key or ""
+
 def _is_gemma4(name: str | None) -> bool:
     n = (name or "").lower()
     return "gemma-4" in n or "gemma4" in n
@@ -155,7 +168,7 @@ def prepare_multimodal_content(prompt: str, image_paths: List[str], audio_paths:
     items = list(media_parts or [])
     items.extend({"type": "image", "path": p} for p in image_paths)
     items.extend({"type": "audio", "path": p} for p in audio_paths)
-    media_first = api_type == "gemini" or (api_type in ("ollama", "unsloth") and _is_gemma4(model_name))
+    media_first = api_type == "gemini" or (api_type in ("ollama", "llama-server", "unsloth") and _is_gemma4(model_name))
     if media_first:
         ordered = [x for x in items if x.get("type") in ("image", "video")]
         ordered.append({"type": "text", "text": prompt})
@@ -193,7 +206,7 @@ def prepare_multimodal_content(prompt: str, image_paths: List[str], audio_paths:
             elif typ == "audio":
                 raise ValueError("Audio input is not supported for anthropic")
         return parts, dims
-    if api_type in ("openai", "ollama", "openrouter", "vllm", "unsloth"):
+    if api_type in ("openai", "ollama", "llama-server", "openrouter", "vllm", "unsloth"):
         parts = []
         for item in ordered:
             typ = item.get("type")
@@ -220,7 +233,11 @@ def get_api_config(api_type: str, model_override: str | None = None) -> Provider
     if api_type == "ollama":
         return ProviderConfig(api_base=os.getenv("OLLAMA_API_BASE","http://localhost:11434"),
                               api_key="ollama",
-                              model_name=model_override or os.getenv("OLLAMA_MODEL_NAME","gemma3:12b"))
+                              model_name=model_override or os.getenv("OLLAMA_MODEL_NAME","gemma4:12b"))
+    if api_type == "llama-server":
+        return ProviderConfig(api_base=os.getenv("LLAMA_SERVER_API_BASE","http://127.0.0.1:8080"),
+                              api_key=os.getenv("LLAMA_SERVER_API_KEY","llama-server"),
+                              model_name=model_override or os.getenv("LLAMA_SERVER_MODEL_NAME","unsloth/gemma-4-E2B-it-GGUF:Q4_K_XL"))
     if api_type == "openai":
         return ProviderConfig(api_key=_require_env("OPENAI_API_KEY"),
                               model_name=model_override or os.getenv("OPENAI_MODEL_NAME","gpt-4.1-mini"))
@@ -310,15 +327,10 @@ async def _openai_compat_call_with_auto_tools(*, provider: str, cfg: ProviderCon
                                              temperature: float, top_p: float, frequency_penalty: float, presence_penalty: float,
                                              tools_payload: dict, tool_runtime: Dict[str, Any] | None,
                                              max_rounds: int = 4):
-    base_url = None
-    api_key = cfg.api_key
     max_tokens_key = "max_completion_tokens" if provider == "openai" else "max_tokens"
     max_tokens_val = 12_000 if provider in ("openai", "ollama") else 12_000
-    if provider == "ollama": base_url = f"{cfg.api_base}/v1"
-    if provider == "openrouter": base_url = cfg.api_base
-    if provider == "vllm": base_url = _with_v1_base(cfg.api_base)
-    if provider == "unsloth": base_url = _with_v1_base(cfg.api_base)
-    if provider in ("ollama",): api_key = "ollama"
+    base_url = _openai_compat_base(provider, cfg.api_base)
+    api_key = _openai_compat_key(provider, cfg.api_key)
 
     msgs = build_chat_messages(system_prompt, context, content)
     tools = tools_payload.get("tools")
@@ -395,7 +407,7 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
         logging.info("Call → %s | model=%s T=%.2f P=%.2f FP=%.2f PP=%.2f",
                      provider, cfg.model_name, temp, p_val, freq_pen, pres_pen)
 
-        if provider in ("openai", "ollama", "openrouter", "vllm", "unsloth"):
+        if provider in ("openai", "ollama", "llama-server", "openrouter", "vllm", "unsloth"):
             if provider == "vllm" and not (cfg.api_base or "").rstrip("/").endswith(("/v1",)):
                 pass
             if auto_execute_tools and tools_payload.get("tools"):
@@ -449,22 +461,13 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
     })
     return response
 
-# ─────────────────────── openai-compatible (openai/ollama/openrouter/vllm/unsloth) ─────────
+# ─────────────────────── openai-compatible (openai/ollama/llama-server/openrouter/vllm/unsloth) ─────────
 async def _call_openai_compat(provider: str, content, *, system_prompt, context,
                               temperature, top_p, frequency_penalty, presence_penalty,
                               config: ProviderConfig, tools_payload: dict):
-    base_url = None
-    api_key = config.api_key
     max_tokens_key = "max_completion_tokens" if provider == "openai" else "max_tokens"
-    if provider == "ollama":
-        base_url = f"{config.api_base}/v1"
-        api_key = "ollama"
-    elif provider == "openrouter":
-        base_url = config.api_base
-    elif provider == "vllm":
-        base_url = _with_v1_base(config.api_base)
-    elif provider == "unsloth":
-        base_url = _with_v1_base(config.api_base)
+    base_url = _openai_compat_base(provider, config.api_base)
+    api_key = _openai_compat_key(provider, config.api_key)
 
     msgs = build_chat_messages(system_prompt, context, content)
     m = await _openai_compat_chat(
@@ -543,6 +546,13 @@ async def get_embeddings(text: str | list[str],
         model = model or "all-minilm:latest"
         res = await client.embeddings.create(model=model, input=text)
         return res.data[0].embedding if isinstance(text, str) else [d.embedding for d in res.data]
+    if provider == "llama-server":
+        base = api.api_base or os.getenv("LLAMA_SERVER_API_BASE", "http://127.0.0.1:8080")
+        key = api.api_key or os.getenv("LLAMA_SERVER_API_KEY", "llama-server")
+        client = openai.AsyncOpenAI(base_url=_with_v1_base(base), api_key=key)
+        model = model or os.getenv("LLAMA_SERVER_EMBED_MODEL") or api.model_name
+        res = await client.embeddings.create(model=model, input=text)
+        return res.data[0].embedding if isinstance(text, str) else [d.embedding for d in res.data]
     if provider == "vllm":
         model = model or os.getenv("VLLM_EMBED_MODEL", "jinaai/jina-embeddings-v2-base-en")
         async with aiohttp.ClientSession() as s:
@@ -571,7 +581,7 @@ if __name__ == "__main__":
     import argparse, asyncio as _aio
     ap = argparse.ArgumentParser(description="Multi-API LLM client")
     ap.add_argument("--api", required=True,
-                    choices=["ollama", "openai", "anthropic", "vllm", "openrouter", "gemini", "unsloth"])
+                    choices=["ollama", "llama-server", "openai", "anthropic", "vllm", "openrouter", "gemini", "unsloth"])
     ap.add_argument("--model", help="model override")
     ap.add_argument("--tools", action="store_true", help="enable tool calling (example: get_time)")
     args = ap.parse_args()
@@ -590,7 +600,7 @@ if __name__ == "__main__":
                 user_in,
                 tools=TOOL_SPECS if args.tools else None,
                 tool_runtime=TOOL_RUNTIME if args.tools else None,
-                auto_execute_tools=bool(args.tools) and args.api in ("openai","ollama","openrouter","vllm","unsloth")
+                auto_execute_tools=bool(args.tools) and args.api in ("openai","ollama","llama-server","openrouter","vllm","unsloth")
             ))
         except KeyboardInterrupt:
             break

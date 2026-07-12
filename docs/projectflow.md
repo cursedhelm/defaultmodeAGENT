@@ -75,7 +75,7 @@ graph LR
     subgraph Response["LLM and Output"]
         PC -->|LLM Call| LLM[Language Model]
         LLM -->|Generate| RG[Response]
-        RG -->|Output| DR[Discord Response]
+        RG -->|Output| DR[Platform Adapter Response]
     end
 
     DR -.->|Store Interaction| MI
@@ -92,3 +92,7 @@ graph LR
     class LLM,RG,DR response
 
 ```
+
+Input and output flow through the active `PlatformAdapter` (Discord, TUI, ...), so the same
+pipeline runs on any platform — see `docs/HOOKS.md` for the adapter/runtime contracts.
+The core pipeline lives in `agent/agent_core.py` (`process_message` / `process_files`).

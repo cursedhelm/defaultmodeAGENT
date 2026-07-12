@@ -54,8 +54,40 @@ from bot_config import (
 )
 # libraries logging import for jsonl, sqlite and info logging
 from logger import BotLogger
+from pydantic import BaseModel, Field
 
 init_logging()
+
+
+class BotPrompts(BaseModel):
+    """Hardcoded prompt scaffolding for the command paths that still live in
+    this module (repo commands, channel summarize, thought generation).
+
+    The chat/file paths route through agent_core, whose CorePrompts owns the
+    equivalents; reflection_memory here deliberately duplicates
+    agent_core.PROMPTS.reflection_memory — keep them in sync.
+    """
+    # Thought generation (used by summarize / repo commands)
+    reflection_memory: str = Field(default="Reflections on interactions with @{user_name} ({timestamp}):\n {thought}")
+    file_context_suffix: str = Field(default="\n\nAdditional File Context:\n{file_context}")
+    # Memory-string templates
+    summarize_memory: str = Field(default="Summarized {count} messages from #{channel_name}. Summary: {summary}")
+    repo_chat_memory: str = Field(default="Recollection of'{file_path}' discussing '{task}'.\n {response}")
+    ask_repo_memory: str = Field(default="({timestamp}) Asked repo question '{question}'. Response: {response}")
+    # Repo command context frames
+    repo_chat_context_header: str = Field(default="Current discord channel: #{channel_name}\n\nOngoing Chatroom Conversation:\n\n<conversation>\n")
+    ask_repo_files_header: str = Field(default="Relevant files in the repository:\n")
+    ask_repo_file_line: str = Field(default="- {file_path} (Relevance: {score:.2f})\n")
+    ask_repo_file_preview: str = Field(default="Content preview: {content}\n\n")
+    ask_repo_context_header: str = Field(default="\nCurrent channel: #{channel_name}\n\n**Ongoing Chatroom Conversation:**\n\n<conversation>\n")
+    conversation_close: str = Field(default="</conversation>\n")
+    history_message_line: str = Field(default=" @{name}: {content}")
+    reaction_entry: str = Field(default="@{user}: {emoji}")
+    repo_chat_reactions_suffix: str = Field(default=" (Reactions: {reactions})")
+    ask_repo_reactions_suffix: str = Field(default="\n(Message Reactions: {reactions})")
+
+
+PROMPTS = BotPrompts()
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -857,7 +889,7 @@ async def generate_and_save_thought(memory_index, user_id, user_name, memory_tex
         conversation_context=conversation_context if conversation_context else ""
     )
     if file_context:
-        thought_prompt += f"\n\nAdditional File Context:\n{file_context}"
+        thought_prompt += PROMPTS.file_context_suffix.format(file_context=file_context)
     context = ""
     themes=format_themes_for_prompt_memoized(bot.memory_index,user_id,mode="sections")
     thought_system_prompt = system_prompts['thought_generation'].replace('{amygdala_response}', str(bot.amygdala_response)).replace('{themes}', themes)
@@ -871,7 +903,9 @@ async def generate_and_save_thought(memory_index, user_id, user_name, memory_tex
     thought_response, thinking_traces = separate_thinking_traces(thought_response)
     await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)
     thought_response = clean_response(thought_response)
-    memory_string = f"Reflections on interactions with @{user_name} ({storage_timestamp}):\n {thought_response}"
+    memory_string = PROMPTS.reflection_memory.format(
+        user_name=user_name, timestamp=storage_timestamp, thought=thought_response,
+    )
     bot.logger.debug(f"Pre-memory addition string: {memory_string}")
     await memory_index.add_memory_async(user_id, memory_string)
     bot.logger.debug(f"Post-memory addition: {memory_index.user_memories[user_id][-1]}")
@@ -1497,7 +1531,7 @@ def setup_bot(prompt_path=None, bot_id=None):
                     await ctx.send(f"{ctx.author.mention}, I've sent you a DM with the summary of #{channel.name}.")
             except discord.Forbidden:
                 await ctx.send("I couldn't send you a DM. Please check your privacy settings and try again.")
-            memory_text = f"Summarized {n} messages from #{channel.name}. Summary: {summary}"
+            memory_text = PROMPTS.summarize_memory.format(count=n, channel_name=channel.name, summary=summary)
             await generate_and_save_thought(
                 memory_index=memory_index,
                 user_id=str(ctx.author.id),
@@ -1604,9 +1638,9 @@ def setup_bot(prompt_path=None, bot_id=None):
                     await ctx.send("Error: Required prompt templates are missing.")
                     return
                 # Build context
-                context = f"Current discord channel: #{ctx.channel.name if hasattr(ctx.channel, 'name') else 'Direct Message'}\n\n"
-                context += "Ongoing Chatroom Conversation:\n\n"
-                context += "<conversation>\n"
+                context = PROMPTS.repo_chat_context_header.format(
+                    channel_name=ctx.channel.name if hasattr(ctx.channel, 'name') else 'Direct Message'
+                )
                 messages = []
                 async for msg in ctx.channel.history(limit=MAX_CONVERSATION_HISTORY):
                     if msg.id != ctx.message.id:  # Skip the command message
@@ -1617,7 +1651,7 @@ def setup_bot(prompt_path=None, bot_id=None):
                         msg_content = sanitize_mentions(msg.content, combined_mentions)
                         truncated_content = truncate_middle(msg_content, max_tokens=TRUNCATION_LENGTH)
                         clean_name = msg.author.name
-                        formatted_msg = f" @{clean_name}: {truncated_content}"
+                        formatted_msg = PROMPTS.history_message_line.format(name=clean_name, content=truncated_content)
                         # Add reactions if present
                         if msg.reactions:
                             reaction_parts = []
@@ -1625,14 +1659,14 @@ def setup_bot(prompt_path=None, bot_id=None):
                                 reaction_emoji = str(reaction.emoji)
                                 async for user in reaction.users():
                                     reaction_user_name = user.name
-                                    reaction_parts.append(f"@{reaction_user_name}: {reaction_emoji}")
+                                    reaction_parts.append(PROMPTS.reaction_entry.format(user=reaction_user_name, emoji=reaction_emoji))
                             if reaction_parts:
-                                formatted_msg += f" (Reactions: {' '.join(reaction_parts)})"
+                                formatted_msg += PROMPTS.repo_chat_reactions_suffix.format(reactions=' '.join(reaction_parts))
                         messages.append(formatted_msg)
 
                 for msg in reversed(messages):
                     context += f"{msg}\n"
-                context += "</conversation>\n"
+                context += PROMPTS.conversation_close
 
                 prompt = prompt_formats['repo_file_chat'].format(
                     file_path=file_path,
@@ -1656,7 +1690,9 @@ def setup_bot(prompt_path=None, bot_id=None):
                 formatted_response += f"**Task**: {user_task_description}\n\n"
                 formatted_response += response_content
                 await send_long_message(ctx.channel, formatted_response, bot=bot)
-                memory_text = f"Recollection of'{file_path}' discussing '{user_task_description}'.\n {response_content}"
+                memory_text = PROMPTS.repo_chat_memory.format(
+                    file_path=file_path, task=user_task_description, response=response_content,
+                )
                 asyncio.create_task(generate_and_save_thought(
                     memory_index=memory_index,
                     user_id=str(ctx.author.id),
@@ -1694,16 +1730,16 @@ def setup_bot(prompt_path=None, bot_id=None):
             if not relevant_files:
                 await ctx.send("No relevant files found in the repository for this question.")
                 return
-            context = "Relevant files in the repository:\n"
-            file_links = []  
+            context = PROMPTS.ask_repo_files_header
+            file_links = []
             for file_path, score in relevant_files:
-                context += f"- {file_path} (Relevance: {score:.2f})\n"
+                context += PROMPTS.ask_repo_file_line.format(file_path=file_path, score=score)
                 file_content = github_repo.get_file_content(file_path)
-                context += f"Content preview: {truncate_middle(file_content, 1000)}\n\n"
+                context += PROMPTS.ask_repo_file_preview.format(content=truncate_middle(file_content, 1000))
                 file_links.append(f"{file_path}")
-            context += f"\nCurrent channel: #{ctx.channel.name if hasattr(ctx.channel, 'name') else 'Direct Message'}\n\n"
-            context += "**Ongoing Chatroom Conversation:**\n\n"
-            context += "<conversation>\n"
+            context += PROMPTS.ask_repo_context_header.format(
+                channel_name=ctx.channel.name if hasattr(ctx.channel, 'name') else 'Direct Message'
+            )
             messages = []
             async for msg in ctx.channel.history(limit=MAX_CONVERSATION_HISTORY):
                 if msg.id != ctx.message.id:  # Skip the question message
@@ -1711,22 +1747,22 @@ def setup_bot(prompt_path=None, bot_id=None):
                     msg_content = sanitize_mentions(msg.content, combined_mentions)
                     truncated_content = truncate_middle(msg_content, max_tokens=TRUNCATION_LENGTH)
                     clean_name = msg.author.name
-                    formatted_msg = f" @{clean_name}: {truncated_content}"
+                    formatted_msg = PROMPTS.history_message_line.format(name=clean_name, content=truncated_content)
                     if msg.reactions:
                         reaction_parts = []
                         for reaction in msg.reactions:
                             reaction_emoji = str(reaction.emoji)
                             async for user in reaction.users():
                                 reaction_user_name = user.name
-                                reaction_parts.append(f"@{reaction_user_name}: {reaction_emoji}")
+                                reaction_parts.append(PROMPTS.reaction_entry.format(user=reaction_user_name, emoji=reaction_emoji))
                         
                         if reaction_parts:
-                            formatted_msg += f"\n(Message Reactions: {' '.join(reaction_parts)})"
+                            formatted_msg += PROMPTS.ask_repo_reactions_suffix.format(reactions=' '.join(reaction_parts))
                     
                     messages.append(formatted_msg)
             for msg in reversed(messages):
                 context += f"{msg}\n"
-            context += "</conversation>\n"
+            context += PROMPTS.conversation_close
             prompt = prompt_formats['ask_repo'].format(
                 context=context,
                 question=question
@@ -1752,7 +1788,7 @@ def setup_bot(prompt_path=None, bot_id=None):
             return
         if response:
             timestamp = currentmoment()
-            memory_text = f"({timestamp}) Asked repo question '{question}'. Response: {response}"
+            memory_text = PROMPTS.ask_repo_memory.format(timestamp=timestamp, question=question, response=response)
             await generate_and_save_thought(
                 memory_index=memory_index,
                 user_id=str(ctx.author.id),
@@ -1935,7 +1971,7 @@ def setup_bot(prompt_path=None, bot_id=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run the Discord bot with selected API and model')
-    parser.add_argument('--api', choices=['ollama', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'], 
+    parser.add_argument('--api', choices=['ollama', 'llama-server', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'], 
                         default='ollama', help='Choose the API to use (default: ollama)')
     parser.add_argument('--model', type=str, 
                         help='Specify the model to use. If not provided, defaults will be used based on the API.')
@@ -1944,7 +1980,7 @@ if __name__ == "__main__":
                         help='Path to prompt files directory (default: agent/prompts)')
     parser.add_argument('--bot-name', type=str,
                         help='Name of the bot to run (used for token and cache management)')
-    parser.add_argument('--dmn-api', choices=['ollama', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'], 
+    parser.add_argument('--dmn-api', choices=['ollama', 'llama-server', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'], 
                         help='Choose the API to use for DMN processor (default: use main API)')
     parser.add_argument('--dmn-model', type=str,
                         help='Specify the model to use for DMN processor (default: use main model)')

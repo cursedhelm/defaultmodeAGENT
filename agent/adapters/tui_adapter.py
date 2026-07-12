@@ -9,7 +9,17 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Callable, Tuple
 
+from pydantic import BaseModel, Field
+
 from .base import NormalizedMessage, PlatformAdapter
+
+
+class TUIAdapterPrompts(BaseModel):
+    """Hardcoded prompt strings this adapter injects into LLM context."""
+    context_header: str = Field(default="Current channel: TUI\n")
+
+
+PROMPTS = TUIAdapterPrompts()
 
 
 class TUIAdapter(PlatformAdapter):
@@ -40,7 +50,7 @@ class TUIAdapter(PlatformAdapter):
         return [], {}
 
     def format_context_header(self, msg: NormalizedMessage) -> str:
-        return "Current channel: TUI\n"
+        return PROMPTS.context_header
 
     def format_response(self, response: str, msg: NormalizedMessage) -> str:
         return response

@@ -2,6 +2,21 @@ import re
 from datetime import datetime
 from typing import List, Tuple
 
+from pydantic import BaseModel, Field
+
+
+class ThinkingTracePrompts(BaseModel):
+    """Memory-string template for stored model thinking traces.
+
+    Load-bearing prefix: it is how extracted reasoning identifies itself when
+    it resurfaces in prompts, and the (HH:MM [DD/MM/YY]) timestamp is
+    regex-parsed across the framework.
+    """
+    trace_memory: str = Field(default="Thinking trace from interaction with @{user_name} ({timestamp}):\n {trace}")
+
+
+PROMPTS = ThinkingTracePrompts()
+
 
 _THINK_RE = re.compile(r"<think\b[^>]*>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 
@@ -24,8 +39,8 @@ async def store_thinking_trace(memory_index, user_id: str, user_name: str, trace
         return
 
     storage_timestamp = datetime.now().strftime("%H:%M [%d/%m/%y]")
-    memory_string = (
-        f"Thinking trace from interaction with @{user_name} ({storage_timestamp}):\n {trace}"
+    memory_string = PROMPTS.trace_memory.format(
+        user_name=user_name, timestamp=storage_timestamp, trace=trace,
     )
     await memory_index.add_memory_async(user_id, memory_string)
 

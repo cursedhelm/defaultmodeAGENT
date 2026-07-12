@@ -84,7 +84,7 @@ class AgentRuntime(Protocol):
         """
         Call the configured LLM.  Accepts the same kwargs as
         ``api_client.call_api``: prompt, system_prompt, temperature,
-        api_type_override, model_override, image_paths, etc.
+        api_type_override, model_override, image_paths, audio_paths, etc.
         """
         ...
 

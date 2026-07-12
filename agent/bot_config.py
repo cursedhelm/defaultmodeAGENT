@@ -139,32 +139,42 @@ class DMNConfig(BaseModel):
     # Chronomic distillation mode (replaces LLM call with chronomic_filter)
     use_chronpression: bool = Field(default=False, description="Use chronomic compression instead of LLM for DMN thought distillation")
     chron_compression_max: float = Field(default=0.99, description="Maximum compression ratio for chronomic distillation at full amygdala arousal (0.0-1.0)")
-    
+
+    # Neighbour thinning probability bounds (similarity-graded)
+    thin_p_min: float = Field(default=0.05, description="Min per-term removal probability for distant neighbours")
+    thin_p_max: float = Field(default=0.6, description="Max per-term removal probability for close neighbours (s≈1)")
+
     # Memory presets
     modes: Dict[str, Dict[str, float]] = Field(default_factory=lambda: {
         "forgetful": {
             "combination_threshold": 0.02,
             "similarity_threshold": 0.2,
-            "decay_rate": 0.8,
+            "decay_rate": 0.5,
             "top_k": 24,
             "fuzzy_overlap_threshold": 70,
-            "fuzzy_search_threshold": 80
+            "fuzzy_search_threshold": 80,
+            "thin_p_min": 0.1,
+            "thin_p_max": 0.8,
         },
         "homeostatic": {
             "combination_threshold": 0.3,
             "similarity_threshold": 0.3,
-            "decay_rate": 0.1,
+            "decay_rate": 0.25,
             "top_k": 16,
             "fuzzy_overlap_threshold": 80,
-            "fuzzy_search_threshold": 90
+            "fuzzy_search_threshold": 90,
+            "thin_p_min": 0.05,
+            "thin_p_max": 0.6,
         },
         "conservative": {
             "combination_threshold": 0.8,
             "similarity_threshold": 0.4,
-            "decay_rate": 0.05,
+            "decay_rate": 0.15,
             "top_k": 8,
             "fuzzy_overlap_threshold": 90,
-            "fuzzy_search_threshold": 95
+            "fuzzy_search_threshold": 95,
+            "thin_p_min": 0.02,
+            "thin_p_max": 0.4,
         }
     })
 
@@ -177,7 +187,7 @@ class SpikeConfig(BaseModel):
     compression_ratio: float = Field(default=0.6, description="Chronpression ratio for surface context")
     cooldown_seconds: int = Field(default=120, description="Minimum seconds between spike fires")
     max_surfaces: int = Field(default=8, description="Maximum recent surfaces to consider")
-    recency_window_hours: int = Field(default=24, description="Hours to look back for engaged surfaces")
+    recency_window_hours: int = Field(default=512, description="Hours to look back for engaged surfaces")
     memory_k: int = Field(default=12, description="Number of memories to retrieve for context")
     memory_truncation: int = Field(default=512, description="Max tokens per memory in context")
     theme_weight: float = Field(default=0.3, description="Weight for theme resonance in scoring (0-1)")

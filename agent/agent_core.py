@@ -15,6 +15,8 @@ import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
+
 from bot_config import config
 from chunker import clean_response, truncate_middle
 from context import (
@@ -29,6 +31,62 @@ from temporality import TemporalParser
 from thinking_trace import separate_thinking_traces, store_thinking_traces
 from tools.webSCRAPE import scrape_webpage
 from attention import format_themes_for_prompt
+
+
+class CorePrompts(BaseModel):
+    """Hardcoded prompt scaffolding and memory-string templates.
+
+    Prompt *instructions* live in each bot's YAML files; these are the fixed
+    frames the code wraps around them. The memory templates are load-bearing:
+    stored memories are re-injected into future prompts, their prefix terms
+    seed the inverted index, and the (HH:MM [DD/MM/YY]) timestamp format is
+    parsed by regex across the framework. Treat any change here as a
+    memory-schema migration.
+    """
+    # Fallback prompts for bots whose YAML predates audio/video/combined support
+    fallback_audio: str = Field(default="{context}\nAudio files: {filename}\n@{user_name}: {user_message}")
+    fallback_video: str = Field(default="{context}\nVideo files: {filename}\n@{user_name}: {user_message}")
+    fallback_combined: str = Field(default=(
+        "{context}\nImages:\n{image_files}\nAudio:\n{audio_files}\nVideo:\n{video_files}\n"
+        "Text files:\n{text_files}\n@{user_name}: {user_message}"
+    ))
+    # Default user messages when an attachment arrives with no comment
+    default_audio_message: str = Field(default="Please analyze this audio.")
+    default_video_message: str = Field(default="Please analyze this video.")
+    default_image_message: str = Field(default="Please analyze these images.")
+    default_files_message: str = Field(default="Please analyze these files.")
+    # Scraped web content wrapper
+    web_content_header: str = Field(default="\nWeb Page Content:\n<web_content>\n")
+    web_content_footer: str = Field(default="</web_content>\n\n")
+    url_content_entry: str = Field(default=(
+        "URL Content: {url}\nTitle: {title}\nDescription: {description}\n\nContent:\n{content}"
+    ))
+    url_partial_entry: str = Field(default="URL Content (partial): {url}\nTitle: {title}\n\nContent:\n{content}")
+    # File-analysis context frame (hardcodes the channel header rather than
+    # using adapter.format_context_header — kept verbatim for now)
+    file_context_header: str = Field(default="Current channel: #{channel_name}\n\n")
+    conversation_open: str = Field(default="<conversation>\n")
+    conversation_close: str = Field(default="</conversation>\n")
+    # Thought-prompt additions
+    file_context_suffix: str = Field(default="\n\nAdditional File Context:\n{file_context}")
+    file_contents_header: str = Field(default="File Contents:\n")
+    file_contents_entry: str = Field(default="--- {filename} ---\n{content}\n\n")
+    images_analyzed_line: str = Field(default="Images analyzed: {files}\n")
+    audio_analyzed_line: str = Field(default="Audio analyzed: {files}\n")
+    video_analyzed_line: str = Field(default="Video analyzed as frames: {files}\n")
+    # Memory-string templates — the agent's autobiographical voice
+    channel_memory: str = Field(default=(
+        "@{user_name} in {guild_name} #{channel_name} ({timestamp}): {content}\n@{agent_name}: {response}"
+    ))
+    dm_memory: str = Field(default="@{user_name} in DM ({timestamp}): {content}\n@{agent_name}: {response}")
+    file_memory: str = Field(default=(
+        "({timestamp}) Grokking {files_desc} for User @{user_name} in #{channel_name}. "
+        "User's message: {user_message}\n@{agent_name}: {response}"
+    ))
+    reflection_memory: str = Field(default="Reflections on interactions with @{user_name} ({timestamp}):\n {thought}")
+
+
+PROMPTS = CorePrompts()
 
 # Module-level temporal parser (stateless utility)
 _temporal_parser = TemporalParser()
@@ -58,12 +116,19 @@ def _currentmoment() -> str:
 def _fallback_prompt(kind: str, *, context: str, filename: str, user_message: str, user_name: str,
                      text_files: str = "", image_files: str = "", audio_files: str = "", video_files: str = "") -> str:
     if kind == "audio":
-        return f"{context}\nAudio files: {filename}\n@{user_name}: {user_message or 'Please analyze this audio.'}"
+        return PROMPTS.fallback_audio.format(
+            context=context, filename=filename, user_name=user_name,
+            user_message=user_message or PROMPTS.default_audio_message,
+        )
     if kind == "video":
-        return f"{context}\nVideo files: {filename}\n@{user_name}: {user_message or 'Please analyze this video.'}"
-    return (
-        f"{context}\nImages:\n{image_files}\nAudio:\n{audio_files}\nVideo:\n{video_files}\n"
-        f"Text files:\n{text_files}\n@{user_name}: {user_message or 'Please analyze these files.'}"
+        return PROMPTS.fallback_video.format(
+            context=context, filename=filename, user_name=user_name,
+            user_message=user_message or PROMPTS.default_video_message,
+        )
+    return PROMPTS.fallback_combined.format(
+        context=context, image_files=image_files, audio_files=audio_files,
+        video_files=video_files, text_files=text_files, user_name=user_name,
+        user_message=user_message or PROMPTS.default_files_message,
     )
 
 
@@ -94,23 +159,22 @@ def _build_url_context(url_results: list, truncation_len: int):
         if data.get("image_paths"):
             image_paths.extend(data["image_paths"])
         if ctype not in ("error", "none", "html_preview"):
-            contents.append(
-                f"URL Content: {data['url']}\nTitle: {data['title']}\n"
-                f"Description: {data['description']}\n\nContent:\n{data['content']}"
-            )
+            contents.append(PROMPTS.url_content_entry.format(
+                url=data['url'], title=data['title'],
+                description=data['description'], content=data['content'],
+            ))
         elif ctype == "html_preview" and data.get("content"):
-            contents.append(
-                f"URL Content (partial): {data['url']}\nTitle: {data['title']}\n\n"
-                f"Content:\n{data['content']}"
-            )
+            contents.append(PROMPTS.url_partial_entry.format(
+                url=data['url'], title=data['title'], content=data['content'],
+            ))
         elif ctype == "none":
             errors.append((data["url"], data.get("description") or "Could not fetch content"))
     if not contents:
         return "", errors, image_paths
-    ctx = "\nWeb Page Content:\n<web_content>\n"
+    ctx = PROMPTS.web_content_header
     for c in contents:
         ctx += f"{truncate_middle(c, max_tokens=truncation_len)}\n"
-    ctx += "</web_content>\n\n"
+    ctx += PROMPTS.web_content_footer
     return ctx, errors, image_paths
 
 
@@ -246,14 +310,17 @@ async def process_message(
 
             timestamp = _currentmoment()
             if not msg.is_dm:
-                memory_text = (
-                    f"@{user_name} in {msg.guild_name} #{msg.channel_name} ({timestamp}): "
-                    f"{sanitized_content}\n@{runtime.agent_name}: {response_content}"
+                memory_text = PROMPTS.channel_memory.format(
+                    user_name=user_name, guild_name=msg.guild_name,
+                    channel_name=msg.channel_name, timestamp=timestamp,
+                    content=sanitized_content, agent_name=runtime.agent_name,
+                    response=response_content,
                 )
             else:
-                memory_text = (
-                    f"@{user_name} in DM ({timestamp}): "
-                    f"{sanitized_content}\n@{runtime.agent_name}: {response_content}"
+                memory_text = PROMPTS.dm_memory.format(
+                    user_name=user_name, timestamp=timestamp,
+                    content=sanitized_content, agent_name=runtime.agent_name,
+                    response=response_content,
                 )
 
             await memory_index.add_memory_async(user_id, memory_text)
@@ -557,11 +624,11 @@ async def process_files(
             history_msgs, reactions_map, _temporal_parser, HARSH_TRUNCATION_LENGTH
         )
 
-        context = f"Current channel: #{msg.channel_name}\n\n"
-        context += "<conversation>\n"
+        context = PROMPTS.file_context_header.format(channel_name=msg.channel_name)
+        context += PROMPTS.conversation_open
         for m in formatted_msgs:
             context += f"{m}\n"
-        context += "</conversation>\n"
+        context += PROMPTS.conversation_close
 
         amygdala = str(runtime.amygdala_response)
         themes = ", ".join(_themes_memoized(memory_index, user_id, mode="just_user").split())
@@ -580,7 +647,7 @@ async def process_files(
                     f"{t['filename']}: {truncate_middle(t['content'], 1000)}"
                     for t in text_contents
                 ),
-                user_message=user_message or "Please analyze these files.",
+                user_message=user_message or PROMPTS.default_files_message,
                 user_name=user_name,
             ) if prompt_tpl else _fallback_prompt(
                 "combined", context=context, image_files="\n".join(image_files),
@@ -599,7 +666,7 @@ async def process_files(
             prompt = prompt_formats["analyze_image"].format(
                 context=context,
                 filename=", ".join(image_files),
-                user_message=user_message or "Please analyze these images.",
+                user_message=user_message or PROMPTS.default_image_message,
                 user_name=user_name,
             )
             system_prompt = (
@@ -612,7 +679,7 @@ async def process_files(
             prompt = prompt_tpl.format(
                 context=context,
                 filename=", ".join(audio_files),
-                user_message=user_message or "Please analyze this audio.",
+                user_message=user_message or PROMPTS.default_audio_message,
                 user_name=user_name,
             ) if prompt_tpl else _fallback_prompt("audio", context=context, filename=", ".join(audio_files), user_message=user_message, user_name=user_name)
             system_prompt = (
@@ -625,7 +692,7 @@ async def process_files(
             prompt = prompt_tpl.format(
                 context=context,
                 filename=", ".join(video_files),
-                user_message=user_message or "Please analyze this video.",
+                user_message=user_message or PROMPTS.default_video_message,
                 user_name=user_name,
             ) if prompt_tpl else _fallback_prompt("video", context=context, filename=", ".join(video_files), user_message=user_message, user_name=user_name)
             system_prompt = (
@@ -689,28 +756,29 @@ async def process_files(
 
             timestamp = _currentmoment()
             sanitized_msg = adapter.sanitize_content(user_message, msg)
-            memory_text = (
-                f"({timestamp}) Grokking {' and '.join(files_desc)} for User @{user_name} "
-                f"in #{msg.channel_name}. User's message: {sanitized_msg}\n"
-                f"@{runtime.agent_name}: {response_content}"
+            memory_text = PROMPTS.file_memory.format(
+                timestamp=timestamp, files_desc=' and '.join(files_desc),
+                user_name=user_name, channel_name=msg.channel_name,
+                user_message=sanitized_msg, agent_name=runtime.agent_name,
+                response=response_content,
             )
 
             await memory_index.add_memory_async(user_id, memory_text)
 
             file_context = ""
             if text_contents:
-                file_context += "File Contents:\n"
+                file_context += PROMPTS.file_contents_header
                 for fd in text_contents:
-                    file_context += (
-                        f"--- {fd['filename']} ---\n"
-                        f"{truncate_middle(fd['content'], max_tokens=TRUNCATION_LENGTH)}\n\n"
+                    file_context += PROMPTS.file_contents_entry.format(
+                        filename=fd['filename'],
+                        content=truncate_middle(fd['content'], max_tokens=TRUNCATION_LENGTH),
                     )
             if image_files:
-                file_context += f"Images analyzed: {', '.join(image_files)}\n"
+                file_context += PROMPTS.images_analyzed_line.format(files=', '.join(image_files))
             if audio_files:
-                file_context += f"Audio analyzed: {', '.join(audio_files)}\n"
+                file_context += PROMPTS.audio_analyzed_line.format(files=', '.join(audio_files))
             if video_files:
-                file_context += f"Video analyzed as frames: {', '.join(video_files)}\n"
+                file_context += PROMPTS.video_analyzed_line.format(files=', '.join(video_files))
 
             paths_to_cleanup = list(temp_paths) + list(audio_paths) + list(video_frame_paths) + list(media_source_paths)
 
@@ -800,7 +868,7 @@ async def generate_and_save_thought(
         conversation_context=conversation_context,
     )
     if file_context:
-        thought_prompt += f"\n\nAdditional File Context:\n{file_context}"
+        thought_prompt += PROMPTS.file_context_suffix.format(file_context=file_context)
 
     themes = _themes_memoized(memory_index, user_id, mode="sections")
     thought_system_prompt = (
@@ -821,8 +889,8 @@ async def generate_and_save_thought(
     await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)
     thought_response = clean_response(thought_response)
 
-    memory_string = (
-        f"Reflections on interactions with @{user_name} ({storage_timestamp}):\n {thought_response}"
+    memory_string = PROMPTS.reflection_memory.format(
+        user_name=user_name, timestamp=storage_timestamp, thought=thought_response,
     )
     runtime.logger.debug(f"Pre-memory addition string: {memory_string}")
     await memory_index.add_memory_async(user_id, memory_string)

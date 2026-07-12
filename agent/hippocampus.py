@@ -1,4 +1,5 @@
 from typing import List, Tuple, Optional, Dict
+from collections import OrderedDict
 import numpy as np
 import aiohttp
 from logger import logging
@@ -14,9 +15,22 @@ from tokenizer import count_tokens
 class Hippocampus:
     def __init__(self, config: HippocampusConfig, logger=None):
         self.config = config
-        self._embedding_cache: Dict[str, np.ndarray] = {}
+        self._embedding_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._embedding_cache_max = int(getattr(config, 'embedding_cache_max', 5000))
         self.embedding_config = EmbeddingConfig()
         self.logger = logger or logging.getLogger("bot.default")
+
+    def _cache_put(self, k: str, v: np.ndarray) -> None:
+        self._embedding_cache[k] = v
+        self._embedding_cache.move_to_end(k)
+        while len(self._embedding_cache) > self._embedding_cache_max:
+            self._embedding_cache.popitem(last=False)
+
+    def _cache_get(self, k: str) -> Optional[np.ndarray]:
+        v = self._embedding_cache.get(k)
+        if v is not None:
+            self._embedding_cache.move_to_end(k)
+        return v
 
     def _smart_compress_memory(self, text: str, max_tokens: int) -> str:
         """
@@ -113,27 +127,29 @@ class Hippocampus:
 
     async def _get_embedding(self, text: str) -> Optional[np.ndarray]:
         """Get cached embeddings with provider-specific handling."""
-        if text not in self._embedding_cache:
-            try:
-                if self.config.embedding_provider == "ollama":
-                    embedding = await self._get_ollama_embedding(text)
-                else:
-                    max_tokens = getattr(self.embedding_config, "max_embed_tokens", 256)
-                    embedding = await get_embeddings(
-                        text,
-                        provider=self.config.embedding_provider,
-                        model=self.config.embedding_model,
-                        max_tokens=max_tokens,
-                    )
-                    embedding = np.array(embedding)
+        cached = self._cache_get(text)
+        if cached is not None:
+            return cached
+        try:
+            if self.config.embedding_provider == "ollama":
+                embedding = await self._get_ollama_embedding(text)
+            else:
+                max_tokens = getattr(self.embedding_config, "max_embed_tokens", 256)
+                embedding = await get_embeddings(
+                    text,
+                    provider=self.config.embedding_provider,
+                    model=self.config.embedding_model,
+                    max_tokens=max_tokens,
+                )
+                embedding = np.array(embedding)
 
-                if embedding is not None:
-                    embedding = embedding / np.linalg.norm(embedding)
-                    self._embedding_cache[text] = embedding
-            except Exception as e:
-                self.logger.error(f"Embedding generation failed: {str(e)}")
-                return None
-        return self._embedding_cache.get(text)
+            if embedding is not None:
+                embedding = embedding / np.linalg.norm(embedding)
+                self._cache_put(text, embedding)
+            return embedding
+        except Exception as e:
+            self.logger.error(f"Embedding generation failed: {str(e)}")
+            return None
 
     async def _get_ollama_embeddings_batch(self, texts: List[str]) -> Optional[np.ndarray]:
         """Get embeddings for multiple texts in a single batch from Ollama API."""
@@ -183,8 +199,9 @@ class Hippocampus:
         embeddings = np.zeros((len(texts), self.embedding_config.dimensions))
 
         for i, text in enumerate(texts):
-            if text in self._embedding_cache:
-                embeddings[i] = self._embedding_cache[text]
+            cached = self._cache_get(text)
+            if cached is not None:
+                embeddings[i] = cached
             else:
                 uncached_texts.append(text)
                 uncached_indices.append(i)
@@ -206,7 +223,7 @@ class Hippocampus:
                 if new_embeddings is not None and len(new_embeddings) > 0:
                     for i, (text, embedding) in enumerate(zip(uncached_texts, new_embeddings)):
                         normalized_embedding = embedding / np.linalg.norm(embedding)
-                        self._embedding_cache[text] = normalized_embedding
+                        self._cache_put(text, normalized_embedding)
                         embeddings[uncached_indices[i]] = normalized_embedding
             except Exception as e:
                 self.logger.error(f"Batch embedding generation failed: {str(e)}")

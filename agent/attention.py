@@ -3,9 +3,28 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import re, logging, threading, itertools, os, json, pickle, time
 from fuzzywuzzy import fuzz
+from pydantic import BaseModel, Field
 from bot_config import config
 
 logger=logging.getLogger(__name__)
+
+
+class ThemePrompts(BaseModel):
+    """Formats for the theme block substituted into the YAML {themes} placeholder.
+
+    This is the memory index whispering its n-gram statistics into the persona
+    prompt. Unknown modes fall through to the bullet format.
+    """
+    tagged_user: str = Field(default="User:{theme}")
+    tagged_bot: str = Field(default="Bot:{theme}")
+    sections: str = Field(default="Current User Preferences:\n{user_themes}\n\nYour Global Preferences:\n{global_themes}")
+    just_user: str = Field(default="Current User Preferences:\n{user_themes}")
+    just_global: str = Field(default="Your Global Preferences:\n{global_themes}")
+    bullet_user: str = Field(default="- U:{theme}")
+    bullet_bot: str = Field(default="- G:{theme}")
+
+
+PROMPTS = ThemePrompts()
 
 _TRIGRAM_CACHE:List[str]=[]
 _CACHE_EXPIRES:datetime=datetime.min.replace(tzinfo=timezone.utc)
@@ -24,11 +43,11 @@ def format_themes_for_prompt(mi,uid:str,spike:bool=False,k_user:int=12,k_global:
     ut=ut[:k_user]
     gt=[t for t in gt if t not in ut][:k_global]
     if mode=="inline":return ", ".join(ut+gt)
-    if mode=="tagged":return ", ".join([f"User:{t}" for t in ut]+[f"Bot:{t}" for t in gt])
-    if mode=="sections":return f"Current User Preferences:\n{', '.join(ut)}\n\nYour Global Preferences:\n{', '.join(gt)}"
-    if mode=="just_user":return f"Current User Preferences:\n{', '.join(ut)}"
-    if mode=="just_global":return f"Your Global Preferences:\n{', '.join(gt)}"
-    return "\n".join([*map(lambda x:f"- U:{x}",ut),*map(lambda x:f"- G:{x}",gt)])
+    if mode=="tagged":return ", ".join([PROMPTS.tagged_user.format(theme=t) for t in ut]+[PROMPTS.tagged_bot.format(theme=t) for t in gt])
+    if mode=="sections":return PROMPTS.sections.format(user_themes=", ".join(ut),global_themes=", ".join(gt))
+    if mode=="just_user":return PROMPTS.just_user.format(user_themes=", ".join(ut))
+    if mode=="just_global":return PROMPTS.just_global.format(global_themes=", ".join(gt))
+    return "\n".join([*(PROMPTS.bullet_user.format(theme=t) for t in ut),*(PROMPTS.bullet_bot.format(theme=t) for t in gt)])
 
 
 def _tok(x:str)->List[str]:

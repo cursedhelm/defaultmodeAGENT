@@ -28,6 +28,11 @@ agent_core.process_message(msg, adapter, runtime, ...)
 
 Produced by your adapter's `normalize()` method and passed everywhere.
 
+> `normalize()` is a convention, not part of the `PlatformAdapter` ABC — its
+> signature differs per platform (Discord's takes a `discord.Message`; the TUI
+> constructs `NormalizedMessage` directly and defines no `normalize()` at all).
+> Build the `NormalizedMessage` however suits your platform.
+
 | Field | Type | Description |
 |---|---|---|
 | `id` | `str` | Platform message ID |
@@ -152,7 +157,8 @@ async def call_api(self, **kwargs) -> str
 ```
 Call the LLM.  Accepts the same kwargs as `api_client.call_api`:
 `prompt`, `system_prompt`, `temperature`, `api_type_override`,
-`model_override`, `image_paths`, etc.
+`model_override`, `image_paths`, `audio_paths`, etc.  Forward `**kwargs`
+verbatim so new media kwargs keep working as the core evolves.
 
 ```python
 def update_api_temperature(self, temperature: float) -> None

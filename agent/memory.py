@@ -165,9 +165,13 @@ class UserMemoryIndex:
     def clean_text(self,text):
         text=text.replace("<|endoftext|>","").replace("<|im_start|>","").replace("<|im_end|>","").lower()
         text=text.translate(str.maketrans(string.punctuation,' '*len(string.punctuation)))
-        text=re.sub(r'\d+','',text)
-        words=[w for w in text.split() if w and w not in self.stopwords and w not in self._global_stops]
-        return ' '.join(words)
+        out=[]
+        for w in text.split():
+            if not w or w in self.stopwords or w in self._global_stops:continue
+            # Drop short pure-digit noise; keep 4-digit tokens (years) and alphanumeric mixed
+            if w.isdigit() and len(w)!=4:continue
+            out.append(w)
+        return ' '.join(out)
     def _safe_ct(self,t):
         try: return _ct(t)
         except: return len(t.split()) if isinstance(t,str) else 0

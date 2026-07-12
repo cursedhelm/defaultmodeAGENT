@@ -37,8 +37,9 @@ import pickle
 import threading
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Set, Tuple
 from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 import re
 from tools.chronpression import chronomic_filter
 from chunker import truncate_middle, clean_response
@@ -56,6 +57,38 @@ from context import (
     rerank_if_enabled
 )
 import discord
+
+
+class SpikePrompts(BaseModel):
+    """Hardcoded prompt scaffolding for spike outreach.
+
+    The tension ladder translates the match score into felt language injected
+    as {tension_desc} into the YAML spike_engagement prompt. The silence
+    vocabulary is the code half of a contract whose instruction half lives in
+    the YAML — keep them in sync. Memory templates are load-bearing (prefix
+    terms enter the inverted index; timestamps are regex-parsed).
+    """
+    # (upper score bound, description) — first bound the score is below wins
+    tension_ladder: List[Tuple[float, str]] = Field(default=[
+        (0.4, "distant, tenuous"),
+        (0.5, "loosely connected"),
+        (0.6, "resonant but uncertain"),
+    ])
+    tension_ceiling: str = Field(default="strongly drawn")
+    # Responses recognised as the agent opting out of sending
+    silence_prefix: str = Field(default="[SILENCE]")
+    silence_tokens: Set[str] = Field(default={"", "none", "pass"})
+    # Location strings injected as {location}
+    location_channel: str = Field(default="#{channel_name} in {guild_name}")
+    location_dm: str = Field(default="DM")
+    # Memory-string templates
+    outreach_memory: str = Field(default="spike reached {location} ({timestamp}):\norphan: {orphan}\nresponse: {response}")
+    silence_memory: str = Field(default="spike considered {location} ({timestamp}):\norphan: {orphan}\n[chose silence]")
+    reflection_memory: str = Field(default="Reflections on spike to {location} ({timestamp}):\n{thought}")
+
+
+PROMPTS = SpikePrompts()
+
 
 @dataclass
 class Surface:
@@ -413,14 +446,11 @@ class SpikeProcessor:
 
         # Compute tension description based on match score
         score = event.target.score
-        if score < 0.4:
-            tension_desc = "distant, tenuous"
-        elif score < 0.5:
-            tension_desc = "loosely connected"
-        elif score < 0.6:
-            tension_desc = "resonant but uncertain"
-        else:
-            tension_desc = "strongly drawn"
+        tension_desc = PROMPTS.tension_ceiling
+        for bound, desc in PROMPTS.tension_ladder:
+            if score < bound:
+                tension_desc = desc
+                break
 
         prompt_state = self._build_prompt_state(
             channel=channel,
@@ -488,8 +518,8 @@ class SpikeProcessor:
             # Detect [SILENCE] choice — agent opts out of sending but still reflects
             chose_silence = (
                 not response
-                or response.strip().lower() in ('', 'none', 'pass')
-                or response.strip().upper().startswith('[SILENCE]')
+                or response.strip().lower() in PROMPTS.silence_tokens
+                or response.strip().upper().startswith(PROMPTS.silence_prefix)
             )
             if chose_silence:
                 self.logger.info("spike.silence chosen")
@@ -502,7 +532,10 @@ class SpikeProcessor:
                     'raw_response': response,
                 })
                 # Still reflect so the silence itself becomes a memory
-                memory_text = f"spike considered {location} ({timestamp_label}):\norphan: {event.orphaned_memory[:200]}\n[chose silence]"
+                memory_text = PROMPTS.silence_memory.format(
+                    location=location, timestamp=timestamp_label,
+                    orphan=event.orphaned_memory[:200],
+                )
                 await self.memory_index.add_memory_async(str(self.bot.user.id), memory_text)
                 asyncio.create_task(self._reflect_on_spike(
                     memory_text=memory_text,
@@ -513,7 +546,10 @@ class SpikeProcessor:
             formatted = format_discord_mentions(response, getattr(channel, 'guild', None), self.bot.mentions_enabled, self.bot)
             await self._send_chunked(channel, formatted)
             self.log_engagement(channel.id)
-            memory_text = f"spike reached {location} ({timestamp_label}):\norphan: {event.orphaned_memory[:200]}\nresponse: {response}"
+            memory_text = PROMPTS.outreach_memory.format(
+                location=location, timestamp=timestamp_label,
+                orphan=event.orphaned_memory[:200], response=response,
+            )
             await self.memory_index.add_memory_async(str(self.bot.user.id), memory_text)
             # Fire reflection as background task (mirrors generate_and_save_thought in process_message)
             asyncio.create_task(self._reflect_on_spike(
@@ -547,9 +583,9 @@ class SpikeProcessor:
         now: datetime
     ) -> SpikePromptState:
         if isinstance(channel, discord.TextChannel):
-            location = f"#{channel.name} in {channel.guild.name}"
+            location = PROMPTS.location_channel.format(channel_name=channel.name, guild_name=channel.guild.name)
         else:
-            location = "DM"
+            location = PROMPTS.location_dm
         timestamp = now.strftime("%H:%M [%d/%m/%y]")
         return SpikePromptState(
             location=location,
@@ -612,7 +648,9 @@ class SpikeProcessor:
                 thinking_traces,
             )
             thought_response = clean_response(thought_response)
-            reflection = f"Reflections on spike to {location} ({storage_timestamp}):\n{thought_response}"
+            reflection = PROMPTS.reflection_memory.format(
+                location=location, timestamp=storage_timestamp, thought=thought_response,
+            )
             await self.memory_index.add_memory_async(str(self.bot.user.id), reflection)
 
             self.logger.info(f"spike.reflect.ok location={location} len={len(thought_response)}")

@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from enum import Enum
 import random
 import re
+
+from pydantic import BaseModel, Field
 
 class TimeFrame(Enum):
     IMMEDIATE = "immediate"     # < 5 minutes
@@ -19,22 +21,15 @@ class TemporalExpression:
     base_expression: str
     time_context: Optional[str] = None
 
-class TemporalParser:
+
+class TemporalVocabulary(BaseModel):
+    """Natural-language time vocabulary injected into prompts.
+
+    Every memory timestamp is rewritten into one of these expressions before
+    it reaches the LLM (random choice within a timeframe for variety), so the
+    agent reasons about time in human terms rather than parsing datetimes.
     """
-    Converts datetime objects into natural language temporal expressions.
-    Focuses on relative time descriptions with optional contextual time-of-day information.
-    """
-    
-    TIME_BRACKETS = {
-        timedelta(minutes=5): TimeFrame.IMMEDIATE,
-        timedelta(hours=1): TimeFrame.RECENT,
-        timedelta(days=1): TimeFrame.TODAY,
-        timedelta(days=2): TimeFrame.YESTERDAY,
-        timedelta(days=7): TimeFrame.THIS_WEEK,
-        timedelta(days=30): TimeFrame.THIS_MONTH
-    }
-    
-    TIME_EXPRESSIONS = {
+    time_expressions: Dict[TimeFrame, List[str]] = Field(default={
         TimeFrame.IMMEDIATE: [
             "just now",
             "moments ago",
@@ -65,16 +60,42 @@ class TemporalParser:
             "{} years ago",
             "long ago"
         ]
-    }
-    
-    TIME_CONTEXTS = {
+    })
+    # Time-of-day contexts as (start_hour, end_hour); night wraps midnight
+    time_contexts: Dict[str, Tuple[int, int]] = Field(default={
         "early_morning": (5, 8),
         "morning": (8, 12),
         "afternoon": (12, 17),
         "evening": (17, 22),
         "night": (22, 5)
+    })
+    unknown_time: str = Field(default="at an unknown time")
+    years_ago: str = Field(default="{} years ago")
+    months_ago: str = Field(default="{} months ago")
+
+
+VOCAB = TemporalVocabulary()
+
+
+class TemporalParser:
+    """
+    Converts datetime objects into natural language temporal expressions.
+    Focuses on relative time descriptions with optional contextual time-of-day information.
+    """
+
+    TIME_BRACKETS = {
+        timedelta(minutes=5): TimeFrame.IMMEDIATE,
+        timedelta(hours=1): TimeFrame.RECENT,
+        timedelta(days=1): TimeFrame.TODAY,
+        timedelta(days=2): TimeFrame.YESTERDAY,
+        timedelta(days=7): TimeFrame.THIS_WEEK,
+        timedelta(days=30): TimeFrame.THIS_MONTH
     }
-    
+
+    # Aliases into the vocabulary model (kept for external references)
+    TIME_EXPRESSIONS = VOCAB.time_expressions
+    TIME_CONTEXTS = VOCAB.time_contexts
+
     def __init__(self, reference_time: Optional[datetime] = None):
         """Initialize with optional reference time"""
         self.reference_time = reference_time or datetime.now()
@@ -147,7 +168,7 @@ class TemporalParser:
         if isinstance(dt, str):
             parsed_dt = self._parse_timestamp(dt)
             if not parsed_dt:
-                return TemporalExpression("at an unknown time")
+                return TemporalExpression(VOCAB.unknown_time)
             dt = parsed_dt
         
         timeframe = self._get_timeframe(dt)
@@ -175,10 +196,10 @@ class TemporalParser:
         else:  # OLDER timeframe
             if time_diff.days >= 365:
                 years = time_diff.days // 365
-                expression = f"{years} years ago"
+                expression = VOCAB.years_ago.format(years)
             else:
                 months = max(1, time_diff.days // 30)
-                expression = f"{months} months ago"
+                expression = VOCAB.months_ago.format(months)
         
         # Add time context for recent timeframes
         time_context = self._get_time_context(dt)

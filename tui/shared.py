@@ -111,6 +111,7 @@ def get_default_model(api: str) -> str:
 def get_api_env_key(api: str) -> Optional[str]:
     return {
         "ollama": None,
+        "llama-server": None,
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "vllm": "VLLM_API_KEY",
@@ -185,6 +186,17 @@ def list_ollama_models() -> list[str]:
     except Exception:
         pass
     return []
+
+
+def list_llama_server_models() -> list[str]:
+    try:
+        import urllib.request, json
+        base = os.getenv("LLAMA_SERVER_API_BASE", "http://127.0.0.1:8080").rstrip("/")
+        models_url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+        with urllib.request.urlopen(models_url, timeout=5) as r:
+            return [m["id"] for m in json.loads(r.read().decode()).get("data", [])]
+    except Exception:
+        return []
 
 
 def list_openai_models() -> list[str]:
@@ -268,6 +280,7 @@ def list_gemini_models() -> list[str]:
 
 MODEL_LISTERS = {
     "ollama": list_ollama_models,
+    "llama-server": list_llama_server_models,
     "openai": list_openai_models,
     "anthropic": list_anthropic_models,
     "vllm": list_vllm_models,
