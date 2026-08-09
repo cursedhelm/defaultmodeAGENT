@@ -35,6 +35,7 @@ from tools.discordSUMMARISER import ChannelSummarizer
 from tools.discordGITHUB import GitHubRepo, RepoIndex, process_repo_contents, repo_processing_event
 from tools.webSCRAPE import scrape_webpage
 from tools.chronpression import chronomic_filter
+from tools.anyDOCER import decode_and_compress, is_document
 # import memory module
 from memory import UserMemoryIndex, CacheManager
 from defaultmode import DMNProcessor
@@ -114,6 +115,7 @@ TEMPERATURE = config.persona.temperature
 DEFAULT_AMYGDALA_RESPONSE = config.persona.default_amygdala_response
 ALLOWED_EXTENSIONS = config.files.allowed_extensions
 ALLOWED_IMAGE_EXTENSIONS = config.files.allowed_image_extensions
+ALLOWED_DOCUMENT_EXTENSIONS = config.files.allowed_document_extensions
 DISCORD_BOT_MANAGER_ROLE = config.discord.bot_manager_role
 TICK_RATE = config.system.tick_rate
 MEMORY_CAPACITY = config.persona.memory_capacity
@@ -292,7 +294,7 @@ async def process_message(message, memory_index, prompt_formats, system_prompts,
     has_supported_files = False
     for att in all_attachments:
         ext = os.path.splitext(att.filename.lower())[1]
-        if (ext in ALLOWED_EXTENSIONS) or (att.content_type and att.content_type.startswith('image/') and ext in ALLOWED_IMAGE_EXTENSIONS):
+        if (ext in ALLOWED_EXTENSIONS) or (att.content_type and att.content_type.startswith('image/') and ext in ALLOWED_IMAGE_EXTENSIONS) or is_document(att.filename, att.content_type):
             has_supported_files = True
             break
     
@@ -467,12 +469,13 @@ async def process_files(message, memory_index, prompt_formats, system_prompts, u
         for attachment in attachments:
             ext = os.path.splitext(attachment.filename.lower())[1]
             is_potentially_image = (attachment.content_type and attachment.content_type.startswith('image/') and ext in ALLOWED_IMAGE_EXTENSIONS)
-            is_potentially_text = ext in ALLOWED_EXTENSIONS
+            is_potentially_document = is_document(attachment.filename, attachment.content_type)
+            is_potentially_text = ext in ALLOWED_EXTENSIONS and not is_potentially_document
             data_to_save = None
             processed_as_image = False
             processed_as_text = False
-            
-            if attachment.size > 1000000:
+
+            if attachment.size > 1000000 and not is_potentially_document:
                 if is_potentially_image:
                     try:
                         image_data = await attachment.read()
@@ -517,6 +520,32 @@ async def process_files(message, memory_index, prompt_formats, system_prompts, u
                     except Exception as e:
                         bot.logger.error(f"Error processing small image {attachment.filename}: {str(e)}")
                         continue
+                elif is_potentially_document:
+                    try:
+                        doc = await decode_and_compress(
+                            await attachment.read(),
+                            attachment.filename,
+                            threshold_chars=config.files.chronpress_threshold,
+                            target_chars=config.files.chronpress_target_chars,
+                        )
+                        if doc["content_type"] == "none":
+                            await message.channel.send(
+                                f"Could not read {attachment.filename} - the document may be "
+                                "encrypted, corrupt, or an unsupported variant."
+                            )
+                            continue
+                        content = doc["content"]
+                        # chronpress already applied above the threshold; hybrid/truncate
+                        # modes still cap the tail so context stays bounded.
+                        if config.files.text_ingestion_mode in ("truncate", "hybrid"):
+                            if len(content) > config.files.truncate_length:
+                                content = content[:config.files.truncate_length]
+                        text_contents.append({"filename": attachment.filename, "content": content})
+                        processed_as_text = True
+                    except Exception as e:
+                        bot.logger.error(f"Error decoding document {attachment.filename}: {str(e)}")
+                        continue
+
                 elif is_potentially_text:
                     try:
                         content = (await attachment.read()).decode("utf-8")
@@ -543,7 +572,7 @@ async def process_files(message, memory_index, prompt_formats, system_prompts, u
                         continue
 
                 else:
-                    await message.channel.send(f"Skipping {attachment.filename} - unsupported type. Supported types: {', '.join(ALLOWED_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS)}")
+                    await message.channel.send(f"Skipping {attachment.filename} - unsupported type. Supported types: {', '.join(ALLOWED_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS | ALLOWED_DOCUMENT_EXTENSIONS)}")
                     continue
             
             if processed_as_image and data_to_save:

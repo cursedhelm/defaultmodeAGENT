@@ -38,6 +38,13 @@ class FileConfig(BaseModel):
     allowed_image_extensions: Set[str] = Field(default={'.jpg','.jpeg','.png','.gif','.bmp'})
     allowed_audio_extensions: Set[str] = Field(default={'.mp3','.wav','.m4a','.ogg','.flac'})
     allowed_video_extensions: Set[str] = Field(default={'.mp4','.mov','.webm','.mkv'})
+    allowed_document_extensions: Set[str] = Field(default={
+        '.doc','.docx','.docm',
+        '.ppt','.pptx','.pptm',
+        '.xls','.xlsx','.xlsm','.xlsb',
+        '.odt','.ods','.odp',
+        '.rtf','.epub','.csv','.pdf',
+    })
 
     # single source of truth
     text_ingestion_mode: str = Field(default="hybrid")

@@ -30,6 +30,7 @@ from runtime import AgentRuntime
 from temporality import TemporalParser
 from thinking_trace import separate_thinking_traces, store_thinking_traces
 from tools.webSCRAPE import scrape_webpage
+from tools.anyDOCER import decode_and_compress, is_document
 from attention import format_themes_for_prompt
 
 
@@ -107,6 +108,7 @@ ALLOWED_EXTENSIONS = config.files.allowed_extensions
 ALLOWED_IMAGE_EXTENSIONS = config.files.allowed_image_extensions
 ALLOWED_AUDIO_EXTENSIONS = config.files.allowed_audio_extensions
 ALLOWED_VIDEO_EXTENSIONS = config.files.allowed_video_extensions
+ALLOWED_DOCUMENT_EXTENSIONS = config.files.allowed_document_extensions
 
 
 def _currentmoment() -> str:
@@ -446,7 +448,8 @@ async def process_files(
                 ext in ALLOWED_VIDEO_EXTENSIONS
                 or (att.content_type and att.content_type.startswith("video/"))
             )
-            is_potentially_text = ext in ALLOWED_EXTENSIONS
+            is_potentially_document = is_document(att.filename, att.content_type)
+            is_potentially_text = ext in ALLOWED_EXTENSIONS and not is_potentially_document
             data_to_save = None
             processed_as_image = False
             processed_as_audio = False
@@ -454,7 +457,7 @@ async def process_files(
             processed_as_text = False
 
             if att.size > 1_000_000:
-                if is_potentially_audio or is_potentially_video:
+                if is_potentially_audio or is_potentially_video or is_potentially_document:
                     pass
                 elif is_potentially_image:
                     try:
@@ -532,6 +535,32 @@ async def process_files(
                     except Exception as e:
                         runtime.logger.error(f"Error reading video {att.filename}: {str(e)}")
                         continue
+                elif is_potentially_document:
+                    try:
+                        doc = await decode_and_compress(
+                            await att.read(),
+                            att.filename,
+                            threshold_chars=config.files.chronpress_threshold,
+                            target_chars=config.files.chronpress_target_chars,
+                        )
+                        if doc["content_type"] == "none":
+                            await adapter.send(
+                                msg.channel_id,
+                                f"Could not read {att.filename} - the document may be "
+                                "encrypted, corrupt, or an unsupported variant.",
+                            )
+                            continue
+                        content = doc["content"]
+                        # chronpress already applied above the threshold; hybrid/truncate
+                        # modes still cap the tail so context stays bounded.
+                        if config.files.text_ingestion_mode in ("truncate", "hybrid"):
+                            if len(content) > config.files.truncate_length:
+                                content = content[: config.files.truncate_length]
+                        text_contents.append({"filename": att.filename, "content": content})
+                        processed_as_text = True
+                    except Exception as e:
+                        runtime.logger.error(f"Error decoding document {att.filename}: {str(e)}")
+                        continue
                 elif is_potentially_text:
                     try:
                         content = (await att.read()).decode("utf-8")
@@ -555,7 +584,7 @@ async def process_files(
                     await adapter.send(
                         msg.channel_id,
                         f"Skipping {att.filename} - unsupported type. "
-                        f"Supported: {', '.join(ALLOWED_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS | ALLOWED_AUDIO_EXTENSIONS | ALLOWED_VIDEO_EXTENSIONS)}",
+                        f"Supported: {', '.join(ALLOWED_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS | ALLOWED_AUDIO_EXTENSIONS | ALLOWED_VIDEO_EXTENSIONS | ALLOWED_DOCUMENT_EXTENSIONS)}",
                     )
                     continue
 
@@ -970,7 +999,7 @@ def _has_supported_files(attachments: List) -> bool:
             and ext in ALLOWED_IMAGE_EXTENSIONS
         ) or ext in ALLOWED_AUDIO_EXTENSIONS or ext in ALLOWED_VIDEO_EXTENSIONS or (
             att.content_type and (att.content_type.startswith("audio/") or att.content_type.startswith("video/"))
-        ):
+        ) or is_document(att.filename, att.content_type):
             return True
     return False
 

@@ -21,6 +21,7 @@ click==8.4.1
 beautifulsoup4==4.15.0
 yt-dlp==2026.6.9
 google-genai==2.9.0
+firecrawl-anydoc==0.1.7
 
 # Security-sensitive direct dependencies are explicitly pinned to the
 # versions verified in the project virtual environment on 2026-06-20.

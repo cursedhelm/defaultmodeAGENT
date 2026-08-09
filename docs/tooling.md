@@ -152,9 +152,58 @@ res = await scrape_webpage(url)  # awaitable; returns the dict above
 
 ---
 
+## anyDOCER — Single-Entry Document Decoder
+
+**Role:** binary documents in, Markdown out. Wraps `anydoc` (firecrawl/anydoc) so a shared `.pdf`/`.docx`/`.xlsx` enters context the same way a `.txt` attachment does.
+
+### Contract (always)
+
+Returns a dict:
+
+```python
+{ "filename", "content", "content_type", "doc_format", "error_info" }
+```
+
+* `content_type ∈ {"document","none"}`
+* `error_info` is **always {}** (silent-error policy; details live in logs)
+* `doc_format` is the detected format (`"pdf"`, `"docx"`, …) or `""` when nothing decoded
+
+### Detection
+
+* Format comes from the **bytes**, not the extension — a mislabeled upload still converts.
+* Signature-less formats (CSV) have no magic bytes; the extension is the fallback hint.
+* 17 extensions across 8 families: Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, PDF.
+
+### Token Discipline
+
+* Decoding is **not** budgeting. `decode_bytes` returns the whole document.
+* `decode_and_compress` chronpresses only above `chronpress_threshold`, targeting `chronpress_target_chars`.
+* Compression is **chunked** (split on blank lines so Markdown tables/lists stay intact) — large PDFs never hit `chronomic_filter` in a single shot.
+
+### Primitives
+
+```python
+from tools.anyDOCER import decode_and_compress, is_document
+
+if is_document(att.filename, att.content_type):      # routing gate
+    doc = await decode_and_compress(data, att.filename,
+                                    threshold_chars=16000, target_chars=8000)
+```
+
+CLI: `python -m tools.anyDOCER -i report.pdf -c -v`
+
+### Guarantees
+
+* Never raises — every failure path returns `content_type="none"`.
+* Encrypted, malformed, and oversized inputs are logged and skipped, not fatal.
+* Degrades gracefully when `anydoc` is not installed (`ANYDOC_AVAILABLE=False`).
+
+---
+
 ## How they interlock (fast sketch)
 
 * **webSCRAPE → chronpression:** transcripts/articles get bimodal filtered before downstream LLMs touch them.  
+* **anyDOCER → chronpression:** anyDOCER is the *decoder* (bytes → Markdown), chronpression the *budgeter* (long Markdown → context-sized). They compose; they don't compete.  
 * **discordGITHUB → cache/index → query:** background job builds a lightweight IR; queries are cheap and immediate. 
 * **discordSUMMARISER → prompts + amygdala:** summarizer temperature flows from state; templates stay external. 
 
