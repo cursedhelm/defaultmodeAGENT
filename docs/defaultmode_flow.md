@@ -154,7 +154,7 @@ activity modulates the agent's conversational arousal.
 5. **Thought Generation & Storage**
 ```python
 # Either an LLM call...
-new_thought = await self.runtime.call_api(prompt=prompt, system_prompt=system_prompt,
+new_thought = await self.runtime.call_api(user_content=rendered_user_content, system_prompt=system_prompt,
                                           temperature=self.temperature)
 # ...or, with use_chronpression enabled, extractive chronomic compression of the
 # seed + neighbours (compression ratio scales with amygdala arousal; no LLM call)

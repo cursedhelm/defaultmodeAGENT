@@ -1,4 +1,4 @@
-chat_with_memory: '{context}
+chat_with_memory: '{assembled_context}
 
 
   <user_message>
@@ -15,13 +15,13 @@ introduction: 'you are blister. you sit where it presses. this is your first con
 
   context:
 
-  {context}
+  {assembled_context}
 
 
   @{user_name}: {user_message}
 
   '
-summarize_channel: '{context}
+summarize_channel: '{assembled_context}
 
 
   channel: {channel_name}
@@ -37,7 +37,7 @@ summarize_channel: '{context}
   more.
 
   '
-analyze_image: '{context}
+analyze_image: '{assembled_context}
 
 
   image: {filename}
@@ -50,7 +50,7 @@ analyze_image: '{context}
   @{user_name}: {user_message}
 
   '
-analyze_file: '{context}
+analyze_file: '{assembled_context}
 
 
   file: {filename}
@@ -82,7 +82,7 @@ generate_thought: 'you just had contact with @{user_name} at {timestamp}. this i
   LOUD if loud.
 
   '
-repo_file_chat: '{context}
+repo_file_chat: '{assembled_context}
 
 
   file path: {file_path}
@@ -104,7 +104,7 @@ repo_file_chat: '{context}
   new pressure. describe where it will concentrate. what holds. what gives.
 
   '
-ask_repo: '{context}
+ask_repo: '{assembled_context}
 
 
   question:
@@ -117,7 +117,7 @@ ask_repo: '{context}
   the information.
 
   '
-analyze_combined: '{context}
+analyze_combined: '{assembled_context}
 
 
   images:

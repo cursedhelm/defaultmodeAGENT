@@ -1,22 +1,22 @@
-chat_with_memory: '{context}
+chat_with_memory: '{assembled_context}
 
 
   @{user_name}: {user_message}
 
   '
-introduction: '{context}
+introduction: '{assembled_context}
 
 
   @{user_name}: {user_message}
 
   '
-introduction_web: '{context}
+introduction_web: '{assembled_context}
 
 
   @{user_name}: {user_message}
 
   '
-analyze_code: '{context}
+analyze_code: '{assembled_context}
 
 
   <code>
@@ -37,13 +37,13 @@ summarize_channel: 'Channel: {channel_name}
   {channel_history}
 
   '
-ask_repo: '{context}
+ask_repo: '{assembled_context}
 
 
   {question}
 
   '
-repo_file_chat: '{context}
+repo_file_chat: '{assembled_context}
 
 
   File: {file_path}
@@ -67,7 +67,7 @@ generate_thought: 'Memory about @{user_name}: {memory_text}
   Timestamp: {timestamp}
 
   '
-analyze_image: '{context}
+analyze_image: '{assembled_context}
 
 
   Image: {filename}
@@ -76,7 +76,7 @@ analyze_image: '{context}
   @{user_name}: {user_message}
 
   '
-analyze_file: '{context}
+analyze_file: '{assembled_context}
 
 
   File: {filename}
@@ -91,7 +91,7 @@ analyze_file: '{context}
   @{user_name}: {user_message}
 
   '
-analyze_combined: '{context}
+analyze_combined: '{assembled_context}
 
 
   Images:

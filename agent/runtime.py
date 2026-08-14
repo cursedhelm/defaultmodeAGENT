@@ -83,8 +83,13 @@ class AgentRuntime(Protocol):
     async def call_api(self, **kwargs) -> str:
         """
         Call the configured LLM.  Accepts the same kwargs as
-        ``api_client.call_api``: prompt, system_prompt, temperature,
-        api_type_override, model_override, image_paths, audio_paths, etc.
+        ``api_client.call_api``: user_content, supplemental_system_context,
+        system_prompt, temperature, api_type_override, model_override,
+        image_paths, audio_paths, etc.
+
+        Normal agent turns render ``assembled_context`` into ``user_content``.
+        Use ``supplemental_system_context`` only for deliberately system-role
+        content, not for the assembled conversation context.
         """
         ...
 

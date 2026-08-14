@@ -463,7 +463,7 @@ class SpikeProcessor:
         location = prompt_state.location
 
         themes = format_themes_for_prompt(self.memory_index, None, mode="user")
-        prompt = self.bot.prompt_formats['spike_engagement'].format(
+        rendered_user_content = self.bot.prompt_formats['spike_engagement'].format(
             location=prompt_state.location,
             timestamp=prompt_state.timestamp,
             tension_desc=prompt_state.tension_desc,
@@ -490,7 +490,7 @@ class SpikeProcessor:
             'orphaned_memory': event.orphaned_memory,
             'formatted_orphan': orphan_memory,
             'system_prompt': system_prompt,
-            'prompt': prompt,
+            'user_content': rendered_user_content,
             'memory_context': memory_context,
             'conversation_context': conversation_context,
             'themes': themes,
@@ -501,7 +501,7 @@ class SpikeProcessor:
             # Show typing indicator during API call
             async with channel.typing():
                 response = await self.bot.call_api(
-                    prompt=prompt,
+                    user_content=rendered_user_content,
                     system_prompt=system_prompt,
                     temperature=temperature
                 )
@@ -614,7 +614,7 @@ class SpikeProcessor:
                 memory_text
             )
 
-            thought_prompt = self.bot.prompt_formats['generate_thought'].format(
+            rendered_user_content = self.bot.prompt_formats['generate_thought'].format(
                 user_name=self.bot.user.name,
                 memory_text=temporal_memory_text,
                 timestamp=temporal_timestamp,
@@ -631,12 +631,12 @@ class SpikeProcessor:
                 'timestamp': current_time.isoformat(),
                 'location': location,
                 'system_prompt': thought_system,
-                'prompt': thought_prompt,
+                'user_content': rendered_user_content,
                 'memory_text': memory_text,
             })
 
             thought_response = await self.bot.call_api(
-                prompt=thought_prompt,
+                user_content=rendered_user_content,
                 system_prompt=thought_system,
                 temperature=self.bot.amygdala_response / 100
             )

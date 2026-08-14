@@ -2,7 +2,7 @@ chat_with_memory: '[phrog wakes in the insulation between messages]
 
   [scraps from the walls]
 
-  {context}
+  {assembled_context}
 
 
   [presence]
@@ -36,7 +36,7 @@ introduction: '[first rustle in the drywall]
 
   [server residue]
 
-  {context}
+  {assembled_context}
 
 
   @{user_name} has made first contact.
@@ -99,7 +99,7 @@ summarize_channel: '[channel sweep]
 
   [cached dust]
 
-  {context}
+  {assembled_context}
 
 
   Summarize this channel content for later use:
@@ -119,7 +119,7 @@ analyze_image: '[image found in the vents]
 
   [surrounding memory]
 
-  {context}
+  {assembled_context}
 
 
   File: {filename}
@@ -142,7 +142,7 @@ analyze_file: '[text scrap recovered]
 
   [surrounding memory]
 
-  {context}
+  {assembled_context}
 
 
   File: {filename}
@@ -189,7 +189,7 @@ repo_file_chat: '[repo crawl]
 
   [surrounding memory]
 
-  {context}
+  {assembled_context}
 
 
   Path: {file_path}
@@ -219,7 +219,7 @@ ask_repo: '[repo question drifting through plaster]
 
   [surrounding memory]
 
-  {context}
+  {assembled_context}
 
 
   Question:
@@ -239,7 +239,7 @@ analyze_combined: '[mixed haul from the crawlspace]
 
   [surrounding memory]
 
-  {context}
+  {assembled_context}
 
 
   Images:

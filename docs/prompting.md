@@ -26,7 +26,7 @@ Each agent = 2 layers:
 
 1. **System Prompts** (role, rules, state): keys like `default_chat`, `file_analysis`, `repo_file_chat`, `ask_repo`, `channel_summarization`, `thought_generation`, `image_analysis`, `combined_analysis`, plus optional `attention_triggers`. These templates include `{amygdala_response}` and may embed `{themes}`.   
 
-2. **Prompt Formats** (task-specific f-strings): keys like `chat_with_memory`, `introduction`, `analyze_file`, `analyze_image`, `analyze_combined`, `repo_file_chat`, `ask_repo`, `summarize_channel`, `generate_thought`. They carry `{context}`, `{user_name}`, `{user_message}`, `{filename}`, `{file_content}`, `{image_files}`, `{text_files}`, `{file_path}`, `{repo_code}`, `{question}`, `{timestamp}`, `{memory_text}`.   
+2. **Prompt Formats** (task-specific f-strings): keys like `chat_with_memory`, `introduction`, `analyze_file`, `analyze_image`, `analyze_combined`, `repo_file_chat`, `ask_repo`, `summarize_channel`, `generate_thought`. They carry `{assembled_context}`, `{user_name}`, `{user_message}`, `{filename}`, `{file_content}`, `{image_files}`, `{text_files}`, `{file_path}`, `{repo_code}`, `{question}`, `{timestamp}`, `{memory_text}`.
 
 **Runtime binding**: the bot selects a format (`introduction` vs `chat_with_memory`), fills variables, and pairs it with the matching system key (`default_chat`, etc.). Thoughts use `thought_generation` + `generate_thought`.  
 
@@ -106,23 +106,23 @@ This is pure formatting: shove context + user I/O + content into tight shapes pe
 ```yaml
 # prompt_formats.yaml (skeleton)
 chat_with_memory: |
-  {context}
+  {assembled_context}
   @{user_name}: {user_message}
 
 analyze_file: |
-  {context}
+  {assembled_context}
   File: {filename}
   Content:
   {file_content}
   User: @{user_name} — {user_message}
 
 analyze_image: |
-  {context}
+  {assembled_context}
   Image: {filename}
   User: @{user_name} — {user_message}
 
 analyze_combined: |
-  {context}
+  {assembled_context}
   Images:
   {image_files}
   Text:
@@ -130,7 +130,7 @@ analyze_combined: |
   User: @{user_name} — {user_message}
 
 repo_file_chat: |
-  {context}
+  {assembled_context}
   File: {file_path}
   Type: {code_type}
   Content:
@@ -138,7 +138,7 @@ repo_file_chat: |
   Task: {user_task_description}
 
 ask_repo: |
-  {context}
+  {assembled_context}
   {question}
 
 generate_thought: |
@@ -153,7 +153,7 @@ generate_thought: |
 ## Required variables (by key)
 
 * **System**: `{amygdala_response}`, optionally `{themes}`, `{name}`.
-* **Chat**: `{context}`, `{user_name}`, `{user_message}`.
+* **Chat**: `{assembled_context}`, `{user_name}`, `{user_message}`.
 * **Files**: `{filename}`, `{file_content}`.
 * **Images**: `{filename}` or `{image_files}`.
 * **Repo**: `{file_path}`, `{code_type}`, `{repo_code}`, `{user_task_description}`; or `{question}` (RAG).
@@ -183,7 +183,7 @@ Each agent may ship a face/body/banner for continuity and rigging:
 ## Design notes (operational)
 
 * **Pairing**: `system_prompts[key]` + `prompt_formats[key]` must exist for a task; the bot raises if a required pair is missing (esp. combined analysis). 
-* **Context engine**: the runner weaves `<conversation>`, memories, URLs, and reactions into `{context}` before formatting.  
+* **Context engine**: the runner weaves `<conversation>`, memories, URLs, and reactions into `{assembled_context}` before formatting the user-role content. It is not also sent as supplemental system context.
 * **DMN/Thoughts**: post-reply, the bot emits an internal “thought” via `thought_generation` using your formats; this is memory fuel, not for users. 
 
 ---
@@ -203,7 +203,7 @@ attention_triggers:
 ```yaml
 # agent/prompts/sharp/prompt_formats.yaml
 chat_with_memory: |
-  {context}
+  {assembled_context}
   @{user_name}: {user_message}
 ```
 

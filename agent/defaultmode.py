@@ -383,7 +383,7 @@ class DMNProcessor:
             lambda m: f"({self.temporal_parser.get_temporal_expression(datetime.strptime(f'{m.group(1)}:{m.group(2)} {m.group(3)}', '%H:%M %d/%m/%y')).base_expression})", 
             seed_memory)
 
-        prompt = self.prompt_formats['generate_dmn_thought'].format(
+        rendered_user_content = self.prompt_formats['generate_dmn_thought'].format(
             memory_text=memory_context,
             seed_memory=temporally_parsed_seed_memory,
             timestamp=timestamp,  # Using natural language timestamp
@@ -437,7 +437,7 @@ class DMNProcessor:
             else:
                 # Use call_api with override parameters without changing global state
                 api_kwargs = {
-                    'prompt': prompt,
+                    'user_content': rendered_user_content,
                     'system_prompt': system_prompt,
                     'temperature': self.temperature
                 }
@@ -561,7 +561,7 @@ class DMNProcessor:
                 'user_name': user_name,
                 'seed_memory': seed_memory,
                 'system_prompt': system_prompt,
-                'prompt': prompt,
+                'user_content': rendered_user_content,
                 'generated_thought': new_thought,
                 'amygdala_response': self.amygdala_response,
                 'temperature': self.temperature

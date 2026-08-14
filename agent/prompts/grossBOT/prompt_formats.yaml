@@ -1,4 +1,4 @@
-chat_with_memory: '{context}
+chat_with_memory: '{assembled_context}
 
   Current interaction:
 
@@ -73,7 +73,7 @@ analyze_file: 'Please analyze the following file:
 
   '
 summarize_channel: 'Please provide a concise summary of the following conversation
-  in {context}.
+  in {assembled_context}.
 
   Focus on key topics, decisions, and any important information shared:
 
@@ -86,7 +86,7 @@ summarize_channel: 'Please provide a concise summary of the following conversati
   and highlight any particularly important or interesting exchanges.
 
   '
-ask_repo: 'Context: {context}
+ask_repo: 'Context: {assembled_context}
 
 
   Question: {question}
@@ -141,7 +141,7 @@ generate_thought: 'As @grossBOT based on your interactions with {user_name}, gen
   Thought:
 
   '
-analyze_image: '{context}
+analyze_image: '{assembled_context}
 
 
   grossBOT, analyze the following image:
@@ -158,7 +158,7 @@ analyze_image: '{context}
   User''s message: {user_message}
 
   '
-analyze_combined: 'Context: {context}
+analyze_combined: 'Context: {assembled_context}
 
 
   Analyze these files from our Discord conversation:

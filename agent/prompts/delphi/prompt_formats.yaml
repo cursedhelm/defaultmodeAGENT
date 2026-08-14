@@ -1,6 +1,6 @@
 # Chat prompts
 chat_with_memory: |
-  {context}
+  {assembled_context}
   Current interaction:
   @{user_name}: {user_message}
 
@@ -46,7 +46,7 @@ analyze_code: |
   Provide a brief summary of what the code does, its structure, and any potential improvements or issues you notice.
 
 summarize_channel: |
-  Please provide a concise summary of the following conversation in {context}.
+  Please provide a concise summary of the following conversation in {assembled_context}.
   Focus on key topics, decisions, and any important information shared:
 
   {content}
@@ -55,7 +55,7 @@ summarize_channel: |
   and highlight any particularly important or interesting exchanges.
 
 ask_repo: |
-  Context: {context}
+  Context: {assembled_context}
   
   Question: {question}
   
@@ -94,7 +94,7 @@ generate_thought: |
 
 # Image analysis prompt
 analyze_image: |
-  {context}
+  {assembled_context}
 
   @Delphi, analyze the following image:
   Filename: {filename}
@@ -106,7 +106,7 @@ analyze_image: |
 
 # Text File analysis prompt
 analyze_file: |
-  Context: {context}
+  Context: {assembled_context}
   
   Delphi, analyze the following file:
   Filename: {filename}
@@ -118,7 +118,7 @@ analyze_file: |
   User's message: {user_message}
 
 analyze_combined: |
-  Context: {context}
+  Context: {assembled_context}
   
   @Delphi, analyze these files from our Discord conversation:
   
@@ -133,7 +133,7 @@ analyze_combined: |
   Please provide your analysis of both the images and text files, noting any relationships or patterns between them.
 
   analyze_combined: |
-    Context: {context}
+    Context: {assembled_context}
     
     Analyze these files from our Discord conversation:
     

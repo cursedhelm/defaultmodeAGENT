@@ -6,12 +6,12 @@ The bot can now execute commands based on its own responses, enabling autonomous
 
 ## How It Works
 
-After generating a response to a user message or file, the bot checks if the first line starts with `!`. If it does and matches a whitelisted command, the bot executes that command as if it were calling it on itself.
+After generating a response to a user message or file, the bot scans **every line** of the response for lines starting with `!`. Each line matching a whitelisted command is executed as if the bot were calling it on itself, so a single response can invoke more than one command.
 
 ### Implementation Flow
 
 1. Bot generates response text
-2. Parses first line for command pattern `!command_name [args]`
+2. Scans each line for command pattern `!command_name [args]`
 3. Validates command against `bot_action_commands` whitelist
 4. Creates `FakeMessage` object copying original message attributes
 5. Overrides `author` to bot.user and `content` to command line
@@ -20,20 +20,18 @@ After generating a response to a user message or file, the bot checks if the fir
 
 ### FakeMessage Class
 
-The `FakeMessage` class (discord_bot.py:932-949) creates a message object for self-invocation:
+The `FakeMessage` class in `agent/discord_bot.py` creates a message object for self-invocation. It copies only the attributes discord.py needs, rather than reflecting over the original:
 
 ```python
 class FakeMessage:
     """Creates a fake Discord message for bot self-invocation."""
     def __init__(self, original, bot, content):
-        # copy all attrs from original
-        for attr in dir(original):
-            if not attr.startswith('_') or attr == '_state':
-                try:
-                    setattr(self, attr, getattr(original, attr))
-                except (AttributeError, TypeError):
-                    pass
-        # override specifics
+        # copy only what's needed
+        self._state = original._state
+        self.id = original.id
+        self.channel = original.channel
+        self.guild = getattr(original, 'guild', None)
+        # override for self-invoke
         self.author = bot.user
         self.content = content
         self.mentions = []
@@ -41,9 +39,10 @@ class FakeMessage:
         self.role_mentions = []
         self.attachments = []
         self.reference = None
+        self.interaction_metadata = None
 ```
 
-This preserves important context (channel, guild, permissions) while making the bot appear as the message author.
+This preserves important context (channel, guild, permissions) while making the bot appear as the message author. The explicit copy avoids the `dir()`-based reflection an earlier version used, which could carry over attributes that confused the command parser.
 
 ### Argument Parsing with StringView
 
@@ -90,17 +89,18 @@ Only commands in the `bot_action_commands` whitelist can be self-invoked.
 
 ## Whitelisted Commands
 
-Current whitelist in `bot_config.py:190`:
+Current whitelist — `bot_action_commands` in `agent/bot_config.py` (`DiscordConfig`):
 
 ```python
 bot_action_commands: Set[str] = Field(default={
+    'help',             # List available commands
     'dmn',              # Control background thought generation
     'persona',          # Adjust emotional arousal/temperature
     'add_memory',       # Store important insights
     'ask_repo',         # Query indexed repositories
     'search_memories',  # Search stored memories
-    'kill',            # Disable processing (dormancy)
-    'attention'        # Toggle attention triggers
+    'kill',             # Disable processing (dormancy)
+    'attention',        # Toggle attention triggers
 })
 ```
 

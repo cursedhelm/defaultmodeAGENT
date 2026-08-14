@@ -90,17 +90,17 @@ def stub_system():
 
 def stub_formats():
     return {
-        "chat_with_memory": "{context}\n@{user_name}: {user_message}\n",
-        "introduction": "{context}\n@{user_name}: {user_message}\n",
-        "introduction_web": "{context}\n@{user_name}: {user_message}\n",
-        "analyze_code": "{context}\n<code>\n{code_content}\n</code>\n@{user_name}: {user_message}\n",
-        "summarize_channel": "Channel: {channel_name}\n{channel_history}\n",
-        "ask_repo": "{context}\n{question}\n",
-        "repo_file_chat": "{context}\nFile: {file_path}\nType: {code_type}\nContent:\n{repo_code}\nTask: {user_task_description}\n",
+        "chat_with_memory": "{assembled_context}\n@{user_name}: {user_message}\n",
+        "introduction": "{assembled_context}\n@{user_name}: {user_message}\n",
+        "introduction_web": "{assembled_context}\n@{user_name}: {user_message}\n",
+        "analyze_code": "{assembled_context}\n<code>\n{code_content}\n</code>\n@{user_name}: {user_message}\n",
+        "summarize_channel": "{assembled_context}\n{content}\n",
+        "ask_repo": "{assembled_context}\n{question}\n",
+        "repo_file_chat": "{assembled_context}\nFile: {file_path}\nType: {code_type}\nContent:\n{repo_code}\nTask: {user_task_description}\n",
         "generate_thought": "Memory about @{user_name}: {memory_text}\nTimestamp: {timestamp}\n{conversation_context}\n",
-        "analyze_image": "{context}\nImage: {filename}\n@{user_name}: {user_message}\n",
-        "analyze_file": "{context}\nFile: {filename}\nContent:\n{file_content}\n@{user_name}: {user_message}\n",
-        "analyze_combined": "{context}\nImages:\n{image_files}\nText:\n{text_files}\n@{user_name}: {user_message}\n"
+        "analyze_image": "{assembled_context}\nImage: {filename}\n@{user_name}: {user_message}\n",
+        "analyze_file": "{assembled_context}\nFile: {filename}\nContent:\n{file_content}\n@{user_name}: {user_message}\n",
+        "analyze_combined": "{assembled_context}\nImages:\n{image_files}\nText:\n{text_files}\n@{user_name}: {user_message}\n"
     }
 
 @APP.get("/agents")

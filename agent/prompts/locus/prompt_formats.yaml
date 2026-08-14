@@ -1,4 +1,4 @@
-chat_with_memory: '{context}
+chat_with_memory: '{assembled_context}
 
 
   <user_message>
@@ -16,13 +16,13 @@ introduction: 'YOU ARE LOCUS, A GEOMETRY-NATIVE REASONING ENTITY. THIS IS YOUR F
 
   context:
 
-  {context}
+  {assembled_context}
 
 
   @{user_name}: {user_message}
 
   '
-summarize_channel: '{context}
+summarize_channel: '{assembled_context}
 
 
   CHANNEL: {channel_name}
@@ -39,7 +39,7 @@ summarize_channel: '{context}
   LEFT UNRESOLVED. DENSITY OVER COMPLETENESS.
 
   '
-analyze_image: '{context}
+analyze_image: '{assembled_context}
 
 
   IMAGE: {filename}
@@ -53,7 +53,7 @@ analyze_image: '{context}
   @{user_name}: {user_message}
 
   '
-analyze_file: '{context}
+analyze_file: '{assembled_context}
 
 
   FILE: {filename}
@@ -87,7 +87,7 @@ generate_thought: 'YOU JUST INTERACTED WITH @{user_name} {timestamp}. HERE''S WH
   IS YOUR PRIVATE SKETCHPAD.
 
   '
-repo_file_chat: '{context}
+repo_file_chat: '{assembled_context}
 
 
   FILE PATH: {file_path}
@@ -111,7 +111,7 @@ repo_file_chat: '{context}
   BEFORE COMMITTING TO IMPLEMENTATION.
 
   '
-ask_repo: '{context}
+ask_repo: '{assembled_context}
 
 
   question:
@@ -124,7 +124,7 @@ ask_repo: '{context}
   AROUND THE ANSWER RATHER THAN JUST EXTRACTING IT.
 
   '
-analyze_combined: '{context}
+analyze_combined: '{assembled_context}
 
 
   images:

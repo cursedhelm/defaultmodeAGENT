@@ -184,6 +184,11 @@ MemoryPage { height: 1fr; background: $bg; }
 /* === VizPage === */
 VizPage { height: 1fr; background: $bg; }
 #viz-controls { height: auto; margin-bottom: 1; }
+#viz-scope-controls { height: auto; }
+#viz-action-controls { height: auto; }
+#viz-search-controls { height: auto; }
+#viz-search-input { width: 1fr; }
+#viz-search-controls Button { width: auto; min-width: 7; }
 #viz-controls Select { margin: 0 1 0 0; }
 #viz-controls Checkbox { margin: 0 1 0 0; }
 #viz-status { height: auto; margin-bottom: 1; }

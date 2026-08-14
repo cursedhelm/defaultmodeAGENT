@@ -9,7 +9,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Checkbox, Input, Label, ListView, RichLog
 
 from tui.shared import (
-    PATHS, SUPPORTED_APIS,
+    PATHS, STATE, SUPPORTED_APIS,
     SelectableItem,
     check_api_available,
     discover_bots,
@@ -112,6 +112,7 @@ class ChatPage(Vertical):
         self._prompt_formats: Optional[dict] = None
         self._system_prompts: Optional[dict] = None
         self._connected = False
+        self._connected_bot: Optional[str] = None
 
         self.query_one("#chat-user-input", Input).display = False
 
@@ -313,12 +314,16 @@ class ChatPage(Vertical):
         else:
             self._selected_user = val
             inp.display = False
+        if self._connected_bot and self._selected_bot == self._connected_bot:
+            STATE.update_live_user(self._connected_bot, self._selected_user)
         self._refresh_connect()
 
     @on(Input.Changed, "#chat-user-input")
     def on_user_input_changed(self, event: Input.Changed) -> None:
         v = event.value.strip()
         self._selected_user = v if v else None
+        if self._connected_bot and self._selected_bot == self._connected_bot:
+            STATE.update_live_user(self._connected_bot, self._selected_user)
         self._refresh_connect()
 
     @on(Input.Submitted, "#chat-user-input")
@@ -350,6 +355,9 @@ class ChatPage(Vertical):
     def on_connect_pressed(self) -> None:
         if not self._can_connect():
             return
+        if self._connected_bot and self._memory_index is not None:
+            STATE.unregister_live_context(self._connected_bot, self._memory_index)
+            self._connected_bot = None
         self._connected = False
         self._set_status("[dim]connecting...[/dim]")
         self.query_one("#chat-connect-btn", Button).disabled = True
@@ -391,6 +399,7 @@ class ChatPage(Vertical):
 
     def _on_connect_ready(self, runtime, memory_index, prompt_formats, system_prompts) -> None:
         from adapters.tui_adapter import TUIAdapter
+        from attention import snapshot_theme_cache
 
         log = self.query_one("#chat-log", RichLog)
         bot_label = runtime.agent_name
@@ -398,12 +407,23 @@ class ChatPage(Vertical):
         def _on_send(channel_id: str, text: str) -> None:
             log.write(f"[bold]{bot_label}:[/bold] {text}\n")
 
+        if self._connected_bot and self._memory_index is not None:
+            STATE.unregister_live_context(self._connected_bot, self._memory_index)
+
         self._adapter = TUIAdapter(_on_send)
         self._runtime = runtime
         self._memory_index = memory_index
         self._prompt_formats = prompt_formats
         self._system_prompts = system_prompts
         self._connected = True
+        self._connected_bot = runtime.agent_name
+        STATE.register_live_context(
+            self._connected_bot,
+            memory_index,
+            runtime=runtime,
+            user_id=self._selected_user,
+            theme_provider=snapshot_theme_cache,
+        )
 
         model = self._selected_model or get_default_model(self._selected_api)
         display = self._resolved_name()
@@ -419,6 +439,10 @@ class ChatPage(Vertical):
         self.query_one("#chat-send-btn", Button).disabled = False
         self.query_one("#chat-connect-btn", Button).disabled = False
         self.query_one("#chat-input", Input).focus()
+
+    def on_unmount(self) -> None:
+        if self._connected_bot and self._memory_index is not None:
+            STATE.unregister_live_context(self._connected_bot, self._memory_index)
 
     # ── Send flow ──────────────────────────────────────────────────────────────
 

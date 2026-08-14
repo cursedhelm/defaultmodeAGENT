@@ -1,4 +1,5 @@
-import os, json, base64, asyncio, logging, mimetypes
+import os, json, base64, asyncio, logging, mimetypes, atexit, queue, threading, time
+from collections import defaultdict
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict, Any
@@ -19,6 +20,9 @@ from tokenizer import count_tokens, calculate_image_tokens
 # ───────────────────────────  constants & init  ────────────────────────────
 MAX_IMAGE_DIM = 640
 CONSOLE_PREVIEW_CHARS = 4000
+API_LOG_QUEUE_SIZE = 2048
+API_LOG_BATCH_SIZE = 64
+API_LOG_FLUSH_INTERVAL = 0.5
 color_init(autoreset=True)
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -108,10 +112,22 @@ def _require_env(var: str) -> str:
     if not val: raise EnvironmentError(f"Environment variable {var} is required")
     return val
 
-def build_chat_messages(system: str, context: str, user_content):
+def build_chat_messages(
+    system_prompt: str,
+    supplemental_system_context: str,
+    user_content,
+):
+    """Build one provider-neutral turn from already-rendered user content.
+
+    The agent's assembled conversation context normally lives inside
+    ``user_content``. ``supplemental_system_context`` exists only for callers
+    that deliberately need an additional system-role message.
+    """
     msgs = []
-    if system:  msgs.append({"role": "system", "content": system})
-    if context: msgs.append({"role": "system", "content": context})
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt})
+    if supplemental_system_context:
+        msgs.append({"role": "system", "content": supplemental_system_context})
     msgs.append({"role": "user", "content": user_content})
     return msgs
 
@@ -160,10 +176,11 @@ def encode_image(path: str) -> Tuple[str, Tuple[int, int]]:
         buf = BytesIO(); img.save(buf, format="JPEG", quality=75)
         return base64.b64encode(buf.getvalue()).decode(), img.size
 
-def prepare_multimodal_content(prompt: str, image_paths: List[str], audio_paths: List[str],
+def prepare_multimodal_content(user_content: str, image_paths: List[str], audio_paths: List[str],
                                api_type: str, model_name: str | None = None,
                                media_parts: Optional[List[Dict[str, Any]]] = None) -> Tuple[object, list]:
-    if not image_paths and not audio_paths and not media_parts: return prompt, []
+    if not image_paths and not audio_paths and not media_parts:
+        return user_content, []
 
     items = list(media_parts or [])
     items.extend({"type": "image", "path": p} for p in image_paths)
@@ -171,10 +188,10 @@ def prepare_multimodal_content(prompt: str, image_paths: List[str], audio_paths:
     media_first = api_type == "gemini" or (api_type in ("ollama", "llama-server", "unsloth") and _is_gemma4(model_name))
     if media_first:
         ordered = [x for x in items if x.get("type") in ("image", "video")]
-        ordered.append({"type": "text", "text": prompt})
+        ordered.append({"type": "text", "text": user_content})
         ordered.extend(x for x in items if x.get("type") == "audio")
     else:
-        ordered = [{"type": "text", "text": prompt}, *items]
+        ordered = [{"type": "text", "text": user_content}, *items]
 
     if api_type == "gemini":
         content, dims = [], []
@@ -222,12 +239,125 @@ def prepare_multimodal_content(prompt: str, image_paths: List[str], audio_paths:
         return parts, dims
     raise ValueError(f"Unsupported multimodal provider: {api_type}")
 
-def prepare_image_content(prompt: str, image_paths: List[str], api_type: str) -> Tuple[object, list]:
-    return prepare_multimodal_content(prompt, image_paths, [], api_type)
+def prepare_image_content(user_content: str, image_paths: List[str], api_type: str) -> Tuple[object, list]:
+    return prepare_multimodal_content(user_content, image_paths, [], api_type)
+
+class _BatchedJsonlWriter:
+    """Bounded off-thread JSONL writer used only by this API client module."""
+
+    def __init__(self, *, queue_size: int = API_LOG_QUEUE_SIZE,
+                 batch_size: int = API_LOG_BATCH_SIZE,
+                 flush_interval: float = API_LOG_FLUSH_INTERVAL):
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._batch_size = max(1, batch_size)
+        self._flush_interval = max(0.01, flush_interval)
+        self._stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._closed = False
+        self._dropped = 0
+        self._reported_drops = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="api.log.writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def dropped_records(self) -> int:
+        with self._state_lock:
+            return self._dropped
+
+    def submit(self, data: dict, path: str) -> bool:
+        """Enqueue one shallow-copied record without waiting for disk I/O."""
+        with self._state_lock:
+            if self._closed:
+                return False
+            try:
+                self._queue.put_nowait((os.fspath(path), dict(data)))
+                return True
+            except queue.Full:
+                self._dropped += 1
+                return False
+
+    def _write_batch(self, batch) -> None:
+        lines_by_path = defaultdict(list)
+        for path, data in batch:
+            lines_by_path[path].append(json.dumps(data, ensure_ascii=False))
+        for path, lines in lines_by_path.items():
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+                f.write("\n")
+
+    def _report_drops(self) -> None:
+        dropped = self.dropped_records
+        if dropped != self._reported_drops:
+            logging.warning("API log queue full; dropped %d record(s)", dropped)
+            self._reported_drops = dropped
+
+    def _run(self) -> None:
+        while not self._stop.is_set() or not self._queue.empty():
+            try:
+                first = self._queue.get(timeout=self._flush_interval)
+            except queue.Empty:
+                self._report_drops()
+                continue
+
+            batch = [first]
+            deadline = time.monotonic() + self._flush_interval
+            while len(batch) < self._batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    if self._stop.is_set():
+                        batch.append(self._queue.get_nowait())
+                    else:
+                        batch.append(self._queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            try:
+                self._write_batch(batch)
+            except Exception:
+                logging.exception("Failed to write API log batch")
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
+            self._report_drops()
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+
+_api_log_writer = None
+_api_log_writer_lock = threading.Lock()
+
+
+def _get_api_log_writer() -> _BatchedJsonlWriter:
+    global _api_log_writer
+    if _api_log_writer is None:
+        with _api_log_writer_lock:
+            if _api_log_writer is None:
+                _api_log_writer = _BatchedJsonlWriter()
+                atexit.register(_api_log_writer.shutdown)
+    return _api_log_writer
+
+
+def shutdown_api_logger(timeout: float = 5.0) -> None:
+    """Drain queued API logs and stop this module's private writer."""
+    if _api_log_writer is not None:
+        _api_log_writer.shutdown(timeout=timeout)
+
 
 def log_to_jsonl(data: dict, path: str = "api_calls.jsonl") -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False); f.write("\n")
+    """Queue an API log record; JSON serialization and file I/O stay off-thread."""
+    _get_api_log_writer().submit(data, path)
 
 def get_api_config(api_type: str, model_override: str | None = None) -> ProviderConfig:
     if api_type == "ollama":
@@ -323,7 +453,8 @@ async def _openai_compat_chat(*, base_url: str | None, api_key: str, model: str,
     return r.choices[0].message
 
 async def _openai_compat_call_with_auto_tools(*, provider: str, cfg: ProviderConfig,
-                                             system_prompt: str, context: str, content: object,
+                                             system_prompt: str, supplemental_system_context: str,
+                                             user_content: object,
                                              temperature: float, top_p: float, frequency_penalty: float, presence_penalty: float,
                                              tools_payload: dict, tool_runtime: Dict[str, Any] | None,
                                              max_rounds: int = 4):
@@ -332,7 +463,7 @@ async def _openai_compat_call_with_auto_tools(*, provider: str, cfg: ProviderCon
     base_url = _openai_compat_base(provider, cfg.api_base)
     api_key = _openai_compat_key(provider, cfg.api_key)
 
-    msgs = build_chat_messages(system_prompt, context, content)
+    msgs = build_chat_messages(system_prompt, supplemental_system_context, user_content)
     tools = tools_payload.get("tools")
     tool_choice = tools_payload.get("tool_choice")
 
@@ -367,7 +498,7 @@ async def _openai_compat_call_with_auto_tools(*, provider: str, cfg: ProviderCon
     return ""
 
 # ───────────────────────────  main entry  ──────────────────────────────────
-async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
+async def call_api(user_content: str, *, supplemental_system_context: str = "", system_prompt: str = "",
                    conversation_id=None, temperature: float | None = None,
                    top_p: float | None = None, frequency_penalty: float | None = None,
                    presence_penalty: float | None = None, image_paths: List[str] | None = None,
@@ -377,6 +508,11 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
                    tools: Optional[List[ToolSpec]] = None,
                    tool_runtime: Optional[Dict[str, Any]] = None,
                    auto_execute_tools: bool = False):
+    """Send rendered user content plus any explicitly system-role instructions.
+
+    Agent prompt schemas should interpolate ``assembled_context`` into
+    ``user_content`` and leave ``supplemental_system_context`` empty.
+    """
     temp = temperature if temperature is not None else api.temperature
     p_val = top_p if top_p is not None else api.top_p
     freq_pen = frequency_penalty if frequency_penalty is not None else api.frequency_penalty
@@ -389,9 +525,16 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
         except Exception: pass
 
     _console_preview("System prompt", system_prompt, Fore.LIGHTMAGENTA_EX)
-    _console_preview("User prompt", prompt, Fore.LIGHTCYAN_EX)
+    _console_preview("User content", user_content, Fore.LIGHTCYAN_EX)
 
-    content, dims = prepare_multimodal_content(prompt, image_paths or [], audio_paths or [], provider, order_model, media_parts)
+    prepared_user_content, dims = prepare_multimodal_content(
+        user_content,
+        image_paths or [],
+        audio_paths or [],
+        provider,
+        order_model,
+        media_parts,
+    )
     tools_payload = adapt_tools(tools, provider)
 
     async def dispatch():
@@ -413,21 +556,33 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
             if auto_execute_tools and tools_payload.get("tools"):
                 return await _openai_compat_call_with_auto_tools(
                     provider=provider, cfg=cfg,
-                    system_prompt=system_prompt, context=context, content=content,
+                    system_prompt=system_prompt,
+                    supplemental_system_context=supplemental_system_context,
+                    user_content=prepared_user_content,
                     temperature=temp, top_p=p_val, frequency_penalty=freq_pen, presence_penalty=pres_pen,
                     tools_payload=tools_payload, tool_runtime=tool_runtime
                 )
-            return await _call_openai_compat(provider, content, system_prompt=system_prompt, context=context,
+            return await _call_openai_compat(
+                provider,
+                prepared_user_content,
+                system_prompt=system_prompt,
+                supplemental_system_context=supplemental_system_context,
                                              temperature=temp, top_p=p_val, frequency_penalty=freq_pen, presence_penalty=pres_pen,
                                              config=cfg, tools_payload=tools_payload)
 
         if provider == "anthropic":
-            return await _call_anthropic(content, system_prompt=system_prompt, context=context,
+            return await _call_anthropic(
+                prepared_user_content,
+                system_prompt=system_prompt,
+                supplemental_system_context=supplemental_system_context,
                                          temperature=temp, top_p=p_val, frequency_penalty=freq_pen, presence_penalty=pres_pen,
                                          config=cfg, tools_payload=tools_payload)
 
         if provider == "gemini":
-            return await _call_gemini(content, system_prompt=system_prompt, context=context,
+            return await _call_gemini(
+                prepared_user_content,
+                system_prompt=system_prompt,
+                supplemental_system_context=supplemental_system_context,
                                       temperature=temp, top_p=p_val, frequency_penalty=freq_pen, presence_penalty=pres_pen,
                                       config=cfg, tools_payload=tools_payload)
 
@@ -436,20 +591,28 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
     response = await retry_api_call(dispatch)
     _console_preview("Response", response, Fore.MAGENTA)
 
-    txt = f"{system_prompt}\n{context}\n{prompt}" if (system_prompt or context) else prompt
+    txt = (
+        f"{system_prompt}\n{supplemental_system_context}\n{user_content}"
+        if (system_prompt or supplemental_system_context)
+        else user_content
+    )
     input_tok  = count_tokens(txt) + sum(calculate_image_tokens(w, h) for w, h in dims)
     output_tok = count_tokens(response)
     logging.info("Tokens → Input: %d | Output: %d | Total: %d", input_tok, output_tok, input_tok + output_tok)
 
-    user_field = f"[Media] {prompt}" if (image_paths or audio_paths or media_parts) else prompt
+    logged_user_content = (
+        f"[Media] {user_content}"
+        if (image_paths or audio_paths or media_parts)
+        else user_content
+    )
     log_to_jsonl({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "conversation_id": conversation_id,
         "api_type": provider,
         "model": model,
         "system_prompt": system_prompt,
-        "context": context,
-        "user_input": user_field,
+        "supplemental_system_context": supplemental_system_context,
+        "user_content": logged_user_content,
         "ai_output": response,
         "is_image": bool(image_paths),
         "is_audio": bool(audio_paths),
@@ -462,14 +625,15 @@ async def call_api(prompt: str, *, context: str = "", system_prompt: str = "",
     return response
 
 # ─────────────────────── openai-compatible (openai/ollama/llama-server/openrouter/vllm/unsloth) ─────────
-async def _call_openai_compat(provider: str, content, *, system_prompt, context,
+async def _call_openai_compat(provider: str, user_content, *, system_prompt,
+                              supplemental_system_context,
                               temperature, top_p, frequency_penalty, presence_penalty,
                               config: ProviderConfig, tools_payload: dict):
     max_tokens_key = "max_completion_tokens" if provider == "openai" else "max_tokens"
     base_url = _openai_compat_base(provider, config.api_base)
     api_key = _openai_compat_key(provider, config.api_key)
 
-    msgs = build_chat_messages(system_prompt, context, content)
+    msgs = build_chat_messages(system_prompt, supplemental_system_context, user_content)
     m = await _openai_compat_chat(
         base_url=base_url, api_key=api_key, model=config.model_name, msgs=msgs,
         temperature=temperature, top_p=top_p, frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
@@ -480,15 +644,17 @@ async def _call_openai_compat(provider: str, content, *, system_prompt, context,
     return m.content.strip() if m.content else ""
 
 # ─────────────────────── anthropic ─────────────────
-async def _call_anthropic(content, *, system_prompt, context,
+async def _call_anthropic(user_content, *, system_prompt, supplemental_system_context,
                           temperature, top_p, frequency_penalty, presence_penalty,
                           config: ProviderConfig, tools_payload: dict):
     client = anthropic.AsyncAnthropic(api_key=config.api_key)
-    sys = "\n\n".join([s for s in (system_prompt, context) if s]) or None
+    sys = "\n\n".join(
+        [s for s in (system_prompt, supplemental_system_context) if s]
+    ) or None
     res = await client.messages.create(
         model=config.model_name,
         system=sys,
-        messages=[{"role":"user","content":content}],
+        messages=[{"role":"user","content":user_content}],
         max_tokens=4096,
         temperature=temperature,
         **({} if not tools_payload.get("tools") else {"tools": tools_payload["tools"]})
@@ -506,12 +672,14 @@ def _gemini_parts_from_paths(paths):
         ps.append(types.Part.from_bytes(data=b,mime_type=_mime(p)))
     return ps
 
-async def _call_gemini(content, *, system_prompt, context,
+async def _call_gemini(user_content, *, system_prompt, supplemental_system_context,
                        temperature, top_p, frequency_penalty, presence_penalty,
                        config: ProviderConfig, tools_payload: dict):
     client = genai.Client(api_key=config.api_key)
-    sys = "\n\n".join([s for s in (system_prompt, context) if s]) or None
-    parts = content if isinstance(content, list) else [str(content)]
+    sys = "\n\n".join(
+        [s for s in (system_prompt, supplemental_system_context) if s]
+    ) or None
+    parts = user_content if isinstance(user_content, list) else [str(user_content)]
     cfg = types.GenerateContentConfig(
         system_instruction=sys,
         temperature=temperature,

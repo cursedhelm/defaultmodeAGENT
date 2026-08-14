@@ -156,9 +156,13 @@ Resolve a stored `user_id` string to a display name.  Fall back to
 async def call_api(self, **kwargs) -> str
 ```
 Call the LLM.  Accepts the same kwargs as `api_client.call_api`:
-`prompt`, `system_prompt`, `temperature`, `api_type_override`,
-`model_override`, `image_paths`, `audio_paths`, etc.  Forward `**kwargs`
-verbatim so new media kwargs keep working as the core evolves.
+`user_content`, `supplemental_system_context`, `system_prompt`, `temperature`,
+`api_type_override`, `model_override`, `image_paths`, `audio_paths`, etc.
+Normal agent paths render `{assembled_context}` into `user_content` and leave
+`supplemental_system_context` empty. The latter is an explicit escape hatch for
+content that intentionally needs a second system-role message, not the assembled
+conversation context. Forward `**kwargs` verbatim so new media kwargs keep
+working as the core evolves.
 
 ```python
 def update_api_temperature(self, temperature: float) -> None

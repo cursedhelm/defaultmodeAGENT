@@ -128,9 +128,9 @@ Spike sits alongside DMN and message processing, sharing the same memory index. 
 Every time the bot responds in a channel, it logs the engagement:
 
 ```python
-# In process_message / process_files
-if hasattr(bot, 'spike_processor') and bot.spike_processor:
-    bot.spike_processor.log_engagement(message.channel.id)
+# In agent_core.process_message / agent_core.process_files
+if hasattr(runtime, 'spike_processor') and runtime.spike_processor:
+    runtime.spike_processor.log_engagement(int(msg.channel_id))
 ```
 
 This builds a map of "where have I been recently?"—the surfaces spike can reach toward.
@@ -312,7 +312,7 @@ async def process_spike(self, event: SpikeEvent) -> Optional[str]:
 
 ### Reflection
 
-After a successful spike, `_reflect_on_spike` runs as a background task—a second API call that mirrors `generate_and_save_thought` from `process_message`:
+After a successful spike, `_reflect_on_spike` runs as a background task—a second API call that mirrors `generate_and_save_thought` from `agent_core.process_message`:
 
 ```python
 async def _reflect_on_spike(self, memory_text, location, conversation_context):

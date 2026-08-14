@@ -323,17 +323,17 @@ class PromptSchema(BaseModel):
         "attention_triggers": set(),
     }
     required_formats: ClassVar[Dict[str, Set[str]]] = {
-        "chat_with_memory": {"context", "user_name", "user_message"},
-        "introduction": {"context", "user_name", "user_message"},
-        "introduction_web": {"context", "user_name", "user_message"},
-        "analyze_code": {"context", "code_content", "user_name", "user_message"},
-        "summarize_channel": {"context", "content"},
-        "ask_repo": {"context", "question"},
-        "repo_file_chat": {"file_path", "code_type", "repo_code", "user_task_description", "context"},
+        "chat_with_memory": {"assembled_context", "user_name", "user_message"},
+        "introduction": {"assembled_context", "user_name", "user_message"},
+        "introduction_web": {"assembled_context", "user_name", "user_message"},
+        "analyze_code": {"assembled_context", "code_content", "user_name", "user_message"},
+        "summarize_channel": {"assembled_context", "content"},
+        "ask_repo": {"assembled_context", "question"},
+        "repo_file_chat": {"file_path", "code_type", "repo_code", "user_task_description", "assembled_context"},
         "generate_thought": {"user_name", "memory_text"},
-        "analyze_image": {"context", "filename", "user_message", "user_name"},
-        "analyze_file": {"context", "filename", "file_content", "user_message", "user_name"},
-        "analyze_combined": {"context", "image_files", "text_files", "user_message", "user_name"},
+        "analyze_image": {"assembled_context", "filename", "user_message", "user_name"},
+        "analyze_file": {"assembled_context", "filename", "file_content", "user_message", "user_name"},
+        "analyze_combined": {"assembled_context", "image_files", "text_files", "user_message", "user_name"},
         "spike_engagement": {"tension_desc", "memory", "memory_context", "conversation_context", "location", "timestamp"},
     }
 

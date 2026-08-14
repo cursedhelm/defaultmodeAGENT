@@ -1,6 +1,6 @@
 chat_with_memory: |
   horopaki:
-  {context}
+  {assembled_context}
 
   kōrero o nāianei:
   @{user_name}: {user_message}
@@ -21,7 +21,7 @@ introduction: |
 
 summarize_channel: |
   horopaki hongere:
-  {context}
+  {assembled_context}
 
   ngā ihirangi hei whakarāpopoto:
   {content}
@@ -34,7 +34,7 @@ summarize_channel: |
 
 analyze_image: |
   horopaki:
-  {context}
+  {assembled_context}
 
   pikitia: {filename}
   kōrero a te kaiwhakamahi: {user_message}
@@ -47,7 +47,7 @@ analyze_image: |
 
 analyze_file: |
   horopaki:
-  {context}
+  {assembled_context}
 
   kōnae: {filename}
   ihirangi:
@@ -75,7 +75,7 @@ generate_thought: |
 
 repo_file_chat: |
   horopaki:
-  {context}
+  {assembled_context}
 
   ara kōnae: {file_path}
   momo waehere: {code_type}
@@ -94,7 +94,7 @@ repo_file_chat: |
 
 ask_repo: |
   horopaki:
-  {context}
+  {assembled_context}
 
   pātai:
   {question}
@@ -106,7 +106,7 @@ ask_repo: |
   4. whakamārama i ngā ariā hangarau
 
 analyze_image: |
-  {context}
+  {assembled_context}
 
   ko au ko Koha e mātai pikitia ana:
   kōnae: {filename}
@@ -118,7 +118,7 @@ analyze_image: |
 
 
 analyze_combined: |
-    horopaki: {context}
+    horopaki: {assembled_context}
     
     ko au ko Koha e tuitui ana i ngā kōnae mai i tā tātou kōrerorero Discord:
     

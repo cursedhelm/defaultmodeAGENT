@@ -36,6 +36,21 @@ _USER_REFRESHING:Dict[str,bool]=defaultdict(bool)
 _LAST_TRIGGER_TIME:datetime=datetime.min.replace(tzinfo=timezone.utc)
 _LAST_TRIGGER_TIME_BY_USER:Dict[str,datetime]=defaultdict(lambda:datetime.min.replace(tzinfo=timezone.utc))
 
+
+def snapshot_theme_cache()->Dict:
+    """Return current in-memory themes without loading, refreshing, or saving."""
+    with _LOCK:
+        global_themes=list(_TRIGRAM_CACHE)
+        # User writers replace whole lists, so shallow copies preserve a stable
+        # read-only transport snapshot without invoking theme extraction.
+        user_items=list(_USER_THEME_CACHE.items())
+        global_expires=_CACHE_EXPIRES.timestamp() if _CACHE_EXPIRES.year>1 else None
+    return {
+        'global_themes':global_themes,
+        'user_themes':{str(uid):list(themes) for uid,themes in user_items},
+        'expires_at_epoch':global_expires,
+    }
+
 def format_themes_for_prompt(mi,uid:str,spike:bool=False,k_user:int=12,k_global:int=8,mode:str="just_user")->str:
     ut=get_user_themes(mi,uid) if uid else []
     gt=get_current_themes(mi)
@@ -294,6 +309,21 @@ def get_themes(memory_index,user_id:str=None,include_global:bool=True)->List[str
 def active_triggers(persona_triggers:List[str],memory_index=None,user_id:str=None)->List[str]:
     if memory_index:_maybe_refresh_global(memory_index)
     return list(dict.fromkeys(_dynamic_triggers(persona_triggers,memory_index,user_id)))
+
+def warm_theme_cache(memory_index)->int:
+    """Populate the global theme cache ahead of first use.
+
+    Safe to call redundantly and safe to skip entirely — get_current_themes
+    self-initializes. This only moves the cold-start cost (full trigram
+    extraction over the corpus, when no pickle exists) off the first request
+    and onto startup. Synchronous and blocking; callers on an event loop
+    should dispatch it via asyncio.to_thread. Returns the theme count.
+    """
+    try:
+        return len(get_current_themes(memory_index))
+    except Exception as e:
+        logger.warning(f"Theme cache warm failed: {e}")
+        return 0
 
 def force_rebuild_theme_cache(memory_index)->List[str]:
     th=_extract(_texts_global(memory_index));_save_global(memory_index,th);return th

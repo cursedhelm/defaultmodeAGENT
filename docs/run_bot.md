@@ -2,7 +2,7 @@
 
 ## Overview
 
-`run_bot.py` is the entry point for a [Textual](https://textual.textualize.io/)-based terminal UI that manages defaultMODE Discord bot agents. The application is split across `run_bot.py` (app shell) and the `tui/` package (page modules and shared utilities).
+`run_tui.py` is the entry point for a [Textual](https://textual.textualize.io/)-based terminal UI that manages defaultMODE Discord bot agents. The application is split across `run_tui.py` (app shell) and the `tui/` package (page modules and shared utilities).
 
 Features:
 - **Multi-instance bot launching** with per-instance log streams and stop controls
@@ -18,7 +18,8 @@ Keyboard shortcuts `1`–`5` navigate tabs; `q` quits.
 ## Package Structure
 
 ```
-run_bot.py               ← App entry point and AgentManagerApp shell
+run_tui.py               ← App entry point and AgentManagerApp shell
+agent/viz_live.py        ← localhost live snapshot protocol used by Discord
 tui/
 ├── __init__.py          ← Exports all page classes
 ├── shared.py            ← Models, globals, utility functions, memory ops, viz helpers
@@ -26,7 +27,8 @@ tui/
 ├── logs_page.py         ← LogsPage
 ├── prompts_page.py      ← PromptsPage
 ├── memory_page.py       ← MemoryPage
-└── viz_page.py          ← VizPage
+├── viz_page.py          ← VizPage
+└── viz_graph.py         ← read-only sparse graph model and derived cache
 tui/run_bot.css          ← Pink-accented stylesheet (#ffb6c1 / #ff69b4)
 ```
 
@@ -108,6 +110,7 @@ Global mutable state singleton (`STATE`).
 | `dmn_api` | `str` | DMN API selection |
 | `dmn_model` | `str` | DMN model selection |
 | `instances` | `Dict[str, BotInstance]` | All launched instances keyed by bot name |
+| live contexts | `Dict[str, LiveBotContext]` | In-process Chat memory/runtime references published for read-only consumers |
 | `running_count` | `int` (property) | Count of instances where `running=True` |
 | `is_bot_running(name)` | `bool` | Check if a specific bot is currently running |
 
@@ -216,11 +219,22 @@ Used by `VizPage` for latent-space rendering.
 
 | Function | Purpose |
 |----------|---------|
-| `build_tfidf_vectors(cache, memory_ids)` | Builds normalized TF-IDF matrix; returns `(vectors, terms, raw_magnitudes)` |
-| `reduce_dimensions(vectors, method)` | PCA or UMAP (falls back to PCA → random projection if libraries missing) |
+| `build_tfidf_vectors(cache, memory_ids)` | Builds normalized TF-IDF from surviving inverted-index postings, excluding singleton and very common terms; returns `(vectors, terms, raw_magnitudes)` |
+| `reduce_dimensions(vectors, method)` | Reduces to two dimensions with LSA, PCA, or cosine UMAP |
 | `find_connections(cache, mid, top_k)` | Finds top-K related memories by Jaccard similarity over shared index terms |
 | `render_ascii_viz(nodes, width, height, ...)` | Renders nodes as ASCII canvas with box border, connection lines, and legend |
 | `_draw_line(grid, x1, y1, x2, y2, ...)` | Bresenham-style line draw using `─│╲╱┼` box-drawing characters |
+
+### Read-only graph model
+
+`tui/viz_graph.py` separates the memory graph from its Textual representation.
+`VizGraph` owns the sparse topology, user ownership, read-only theme snapshot,
+cosine-neighbor navigation, search, and serializable node payloads. It resolves
+sources in this order: an in-process Chat `UserMemoryIndex`, a running Discord
+bot's localhost live hook, a current/last-known derived graph cache, then the
+offline `memory_cache.pkl` checkpoint. Both live transports expose the same
+versioned `memory` / `runtime` / `themes` schema. The graph cache is disposable
+and never writes or reconstructs the canonical memory pickle.
 
 #### `SelectableItem(ListItem)`
 
@@ -342,7 +356,9 @@ Memory latent-space visualizer.
 
 **Layout:**
 ```
-[bot select] [user filter] [Global ☐] [method: PCA/UMAP] [Extended ☐] [Load] [Refresh]
+[bot select] [user filter] [method: LSA/PCA/UMAP]
+[Context ☐] [Extended ☐] [Themes ☑] [Refresh State] [Rebuild Map]
+[graph search or #memory-id] [Find] [Next]
 status
 ┌──────────────────────────────┬──────────────────────┐
 │  ASCII canvas                │ Memory Details       │
@@ -351,35 +367,59 @@ status
 ```
 
 **Visualization pipeline:**
-1. Load memory cache
-2. Build TF-IDF vectors for all (or user-filtered) non-null memories
-3. Reduce to 2D via PCA or UMAP
-4. Score nodes: `0.5 × distance_from_centroid + 0.5 × tfidf_magnitude`
-5. Render ASCII canvas with density heatmap and connection lines
+1. Snapshot live Chat or Discord memory read-only, load a derived graph, or read the offline checkpoint
+2. Build one global sparse space from the agent's surviving memory/term associations
+3. Cache that secondary graph independently from `memory_cache.pkl`
+4. Load or reduce to 2D via LSA, PCA, or cosine UMAP
+5. Score nodes: `0.5 × distance_from_centroid + 0.5 × TF-IDF magnitude`
+6. Apply user and theme scopes without changing coordinates
+7. Render a collision-aware terminal canvas with density and connection lines
+
+Selecting **all users** displays the complete global projection. Selecting a user
+shows only that user's memories at their global coordinates. **Context** retains
+other users as dim landmarks. **Refresh State** takes a new live RAM snapshot
+when Chat or a running Discord process hosts that bot, otherwise rereads the
+offline checkpoint. **Rebuild Map** bypasses only the derived coordinates and
+recomputes the projection.
+Normal opening may show the last derived graph immediately after a newer bot
+checkpoint; the status labels it `stale` until **Refresh State** is requested.
+
+Running Discord agents advertise an ephemeral localhost endpoint at
+`cache/<bot>/viz_live.json`. Requests are authenticated by a per-process token
+and stream a consistent memory/runtime/theme snapshot from the warm process.
+The advertisement is removed during graceful shutdown; stale advertisements
+simply fail over to the derived/offline sources. Concurrent snapshot requests
+are serialized to avoid multiplying peak RAM use on large indexes.
 
 **Canvas rendering:**
-- Node characters by score: `◆ ● ◐ ○ · ∘` (high → low)
+- Single-node characters by score: `◆ ● ○ ∘` (high → low)
+- Theme-associated nodes/stacks: `◇ ◈`
 - Selected node: `◉`; connected nodes: `◎`
-- Density heatmap: `░ ▒ ▓` in cells near clusters
+- Braille cells retain 2×4 sub-cell structure; `▓` and `█` mark denser stacks
 - Connection lines between selected and related nodes: `─ │ ╲ ╱ ┼`
-- Up to 16,000 nodes rendered; zoom 1–10×
+- Percentile bounds prevent isolated projection outliers from collapsing the map
+- Every occupied cell retains its complete memory stack for navigation
 
 **Interaction:**
 
 | Input | Action |
 |-------|--------|
-| `W/A/S/D` | Navigate to nearest node in direction |
+| `W/A/S/D` | Navigate to nearest occupied cell in direction |
 | `↑↓←→` | Pan viewport 15% of current range |
 | `+` / `-` | Zoom in / out |
 | `f` | Focus viewport on selected node |
+| `[` / `]` | Cycle memories occupying the selected cell |
+| `n` / `p` | Follow the first/last displayed connection |
 | `Enter` | Show full memory text in detail panel |
-| Mouse click | Select nearest node within tolerance |
+| Mouse click | Select nearest occupied cell; repeated clicks cycle its stack |
 | Scroll up/down | Zoom in/out over canvas |
+| Search + `Find` | Search graph terms/text or jump directly with `#<memory-id>` |
+| `Next` | Cycle through the current search result set |
 
 **Detail panel:**
-- Shows selected memory's text, user, and score
+- Shows selected memory's text, user, score, and matching cached themes
 - Lists top 6 (or 16 in Extended mode) connected memories with similarity score and shared terms
-- Connections panel populates with `find_connections()` (Jaccard similarity via shared index tokens)
+- Connections are sparse cosine neighbors from the same surviving-term graph used by the projection
 
 ---
 

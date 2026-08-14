@@ -20,6 +20,9 @@ prompt_archive/
 temp_files/
 scratch/
 tests/
+!tests/
+tests/*
+!tests/test_api_context_contract.py
 todo/
 
 # python cache folders
@@ -32,6 +35,8 @@ CLAUDE.md
 scratch_thoughts.md
 notes.md
 .claude/
+
+.agents/
 
 # certain agent prompts
 /agent/prompts/delphi/

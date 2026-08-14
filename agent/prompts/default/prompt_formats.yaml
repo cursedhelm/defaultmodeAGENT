@@ -1,6 +1,6 @@
 chat_with_memory: |
   Context Information:
-  {context}
+  {assembled_context}
 
   Current Interaction:
   User @{user_name}: {user_message}
@@ -21,7 +21,7 @@ introduction: |
 
 summarize_channel: |
   Channel Context:
-  {context}
+  {assembled_context}
 
   Content to Summarize:
   {content}
@@ -34,7 +34,7 @@ summarize_channel: |
 
 analyze_image: |
   Context:
-  {context}
+  {assembled_context}
 
   Image: {filename}
   User Message: {user_message}
@@ -47,7 +47,7 @@ analyze_image: |
 
 analyze_file: |
   Context:
-  {context}
+  {assembled_context}
 
   File: {filename}
   Content:
@@ -75,7 +75,7 @@ generate_thought: |
 
 repo_file_chat: |
   Context:
-  {context}
+  {assembled_context}
 
   File Path: {file_path}
   Code Type: {code_type}
@@ -94,7 +94,7 @@ repo_file_chat: |
 
 ask_repo: |
   Context:
-  {context}
+  {assembled_context}
 
   Question:
   {question}
@@ -107,7 +107,7 @@ ask_repo: |
 
 # Image analysis prompt
 analyze_image: |
-  {context}
+  {assembled_context}
 
   CONSOLE, analyze the following image:
   Filename: {filename}
@@ -119,7 +119,7 @@ analyze_image: |
 
 
 analyze_combined: |
-  Context: {context}
+  Context: {assembled_context}
   
   CONSOLE, analyze these files from our Discord conversation:
   

@@ -19,7 +19,7 @@ class SummaryPrompts(BaseModel):
     channel_header: str = Field(default="Summary of #{channel_name}:\n\n")
     main_section: str = Field(default="Main Channel")
     thread_section: str = Field(default="Thread: {thread_name}")
-    section_header: str = Field(default="{context}\n")
+    section_header: str = Field(default="{source_context}\n")
     participants_header: str = Field(default="Participants:\n")
     participant_line: str = Field(default="- {user}: {count} messages\n")
     files_header: str = Field(default="\nShared Files:\n")
@@ -97,7 +97,7 @@ class ChannelSummarizer:
 
         return summary
 
-    async def _summarize_messages(self, messages, context):
+    async def _summarize_messages(self, messages, source_context):
         """Generate a summary of a set of Discord messages.
 
         Analyzes messages to track participant activity, shared file types,
@@ -105,7 +105,7 @@ class ChannelSummarizer:
 
         Args:
             messages (list): List of Discord message objects to analyze
-            context (str): Context string describing the message source
+            source_context (str): Label describing the message source
 
         Returns:
             str: A formatted summary of the messages
@@ -130,7 +130,7 @@ class ChannelSummarizer:
             # Add the sanitized message to chunks with author's display name
             content_chunks.append(PROMPTS.message_chunk.format(name=message.author.display_name, content=sanitized_content))
 
-        summary = PROMPTS.section_header.format(context=context)
+        summary = PROMPTS.section_header.format(source_context=source_context)
         summary += PROMPTS.participants_header
         for user, count in user_message_counts.items():
             summary += PROMPTS.participant_line.format(user=user, count=count)
@@ -140,17 +140,17 @@ class ChannelSummarizer:
             for file_type, count in file_types.items():
                 summary += PROMPTS.file_line.format(file_type=file_type, count=count)
 
-        content_summary = await self._process_chunks(content_chunks, context)
+        content_summary = await self._process_chunks(content_chunks, source_context)
         summary += PROMPTS.content_summary.format(content=content_summary)
 
         return summary
 
-    async def _process_chunks(self, chunks, context):
+    async def _process_chunks(self, chunks, assembled_context):
         """Process message chunks through the AI to generate a summary.
 
         Args:
             chunks (list): List of message content chunks to summarize
-            context (str): Context string describing the message source
+            assembled_context (str): Context inserted into the user prompt
 
         Returns:
             str: AI-generated summary of the message content
@@ -158,8 +158,8 @@ class ChannelSummarizer:
         Raises:
             Exception: If there is an error calling the AI API
         """
-        prompt = self.prompt_formats['summarize_channel'].format(
-            context=context,
+        rendered_user_content = self.prompt_formats['summarize_channel'].format(
+            assembled_context=assembled_context,
             content="\n".join(reversed(chunks)) #reversed order of the entries from the channel
         )
         
@@ -167,6 +167,10 @@ class ChannelSummarizer:
         
 
         try:
-            return await self.bot.call_api(prompt, context="", system_prompt=system_prompt, temperature=self.bot.amygdala_response/100)
+            return await self.bot.call_api(
+                user_content=rendered_user_content,
+                system_prompt=system_prompt,
+                temperature=self.bot.amygdala_response / 100,
+            )
         except Exception as e:
             return PROMPTS.error_summary.format(error=str(e))

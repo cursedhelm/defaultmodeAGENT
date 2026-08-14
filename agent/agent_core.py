@@ -45,10 +45,10 @@ class CorePrompts(BaseModel):
     memory-schema migration.
     """
     # Fallback prompts for bots whose YAML predates audio/video/combined support
-    fallback_audio: str = Field(default="{context}\nAudio files: {filename}\n@{user_name}: {user_message}")
-    fallback_video: str = Field(default="{context}\nVideo files: {filename}\n@{user_name}: {user_message}")
+    fallback_audio: str = Field(default="{assembled_context}\nAudio files: {filename}\n@{user_name}: {user_message}")
+    fallback_video: str = Field(default="{assembled_context}\nVideo files: {filename}\n@{user_name}: {user_message}")
     fallback_combined: str = Field(default=(
-        "{context}\nImages:\n{image_files}\nAudio:\n{audio_files}\nVideo:\n{video_files}\n"
+        "{assembled_context}\nImages:\n{image_files}\nAudio:\n{audio_files}\nVideo:\n{video_files}\n"
         "Text files:\n{text_files}\n@{user_name}: {user_message}"
     ))
     # Default user messages when an attachment arrives with no comment
@@ -115,20 +115,20 @@ def _currentmoment() -> str:
     return datetime.now().strftime("%H:%M [%d/%m/%y]")
 
 
-def _fallback_prompt(kind: str, *, context: str, filename: str, user_message: str, user_name: str,
+def _fallback_prompt(kind: str, *, assembled_context: str, filename: str, user_message: str, user_name: str,
                      text_files: str = "", image_files: str = "", audio_files: str = "", video_files: str = "") -> str:
     if kind == "audio":
         return PROMPTS.fallback_audio.format(
-            context=context, filename=filename, user_name=user_name,
+            assembled_context=assembled_context, filename=filename, user_name=user_name,
             user_message=user_message or PROMPTS.default_audio_message,
         )
     if kind == "video":
         return PROMPTS.fallback_video.format(
-            context=context, filename=filename, user_name=user_name,
+            assembled_context=assembled_context, filename=filename, user_name=user_name,
             user_message=user_message or PROMPTS.default_video_message,
         )
     return PROMPTS.fallback_combined.format(
-        context=context, image_files=image_files, audio_files=audio_files,
+        assembled_context=assembled_context, image_files=image_files, audio_files=audio_files,
         video_files=video_files, text_files=text_files, user_name=user_name,
         user_message=user_message or PROMPTS.default_files_message,
     )
@@ -261,24 +261,28 @@ async def process_message(
             runtime, candidate_memories, search_query, logger=runtime.logger
         )
 
-        context = adapter.format_context_header(msg)
-        context += build_memory_context(relevant_memories, _temporal_parser, TRUNCATION_LENGTH)
+        assembled_context = adapter.format_context_header(msg)
+        assembled_context += build_memory_context(
+            relevant_memories,
+            _temporal_parser,
+            TRUNCATION_LENGTH,
+        )
 
         url_ctx, url_errors, url_image_paths = _build_url_context(
             url_results, WEB_CONTENT_TRUNCATION_LENGTH
         )
         for url, err in url_errors:
             await adapter.send(msg.channel_id, f"Error scraping URL {url}: {err}")
-        context += url_ctx
-        context += build_conversation_context(formatted_msgs)
+        assembled_context += url_ctx
+        assembled_context += build_conversation_context(formatted_msgs)
 
         prompt_key = "introduction" if is_first_interaction else "chat_with_memory"
-        sanitized_context = adapter.sanitize_content(context, msg)
-        prompt = prompt_formats[prompt_key].format(
-            context=sanitized_context,
+        sanitized_assembled_context = adapter.sanitize_content(assembled_context, msg)
+        rendered_user_content = prompt_formats[prompt_key].format(
+            assembled_context=sanitized_assembled_context,
             user_name=user_name,
             user_message=sanitized_content,
-        )
+        ).lstrip()
 
         themes = _themes_memoized(memory_index, user_id, mode="sections")
         system_prompt = (
@@ -290,8 +294,7 @@ async def process_message(
         response_content = None
         async with adapter.thinking(msg.channel_id):
             response_content = await runtime.call_api(
-                prompt=prompt,
-                context=context,
+                user_content=rendered_user_content,
                 system_prompt=system_prompt,
                 temperature=runtime.amygdala_response / 100,
                 image_paths=url_image_paths if url_image_paths else None,
@@ -351,7 +354,7 @@ async def process_message(
                 "reply_to": reply_context,
                 "ai_response": response_content,
                 "system_prompt": system_prompt,
-                "prompt": prompt,
+                "user_content": rendered_user_content,
                 "temperature": runtime.amygdala_response / 100,
             })
 
@@ -653,11 +656,12 @@ async def process_files(
             history_msgs, reactions_map, _temporal_parser, HARSH_TRUNCATION_LENGTH
         )
 
-        context = PROMPTS.file_context_header.format(channel_name=msg.channel_name)
-        context += PROMPTS.conversation_open
+        assembled_context = PROMPTS.file_context_header.format(channel_name=msg.channel_name)
+        assembled_context += PROMPTS.conversation_open
         for m in formatted_msgs:
-            context += f"{m}\n"
-        context += PROMPTS.conversation_close
+            assembled_context += f"{m}\n"
+        assembled_context += PROMPTS.conversation_close
+        sanitized_assembled_context = adapter.sanitize_content(assembled_context, msg)
 
         amygdala = str(runtime.amygdala_response)
         themes = ", ".join(_themes_memoized(memory_index, user_id, mode="just_user").split())
@@ -667,8 +671,8 @@ async def process_files(
             if "analyze_combined" not in prompt_formats or "combined_analysis" not in system_prompts:
                 raise ValueError("Missing required combined analysis prompts")
             prompt_tpl = prompt_formats.get("analyze_combined")
-            prompt = prompt_tpl.format(
-                context=context,
+            rendered_user_content = prompt_tpl.format(
+                assembled_context=sanitized_assembled_context,
                 image_files="\n".join(image_files),
                 audio_files="\n".join(audio_files),
                 video_files="\n".join(video_files),
@@ -678,8 +682,8 @@ async def process_files(
                 ),
                 user_message=user_message or PROMPTS.default_files_message,
                 user_name=user_name,
-            ) if prompt_tpl else _fallback_prompt(
-                "combined", context=context, image_files="\n".join(image_files),
+            ).lstrip() if prompt_tpl else _fallback_prompt(
+                "combined", assembled_context=sanitized_assembled_context, image_files="\n".join(image_files),
                 audio_files="\n".join(audio_files), video_files="\n".join(video_files),
                 text_files="\n".join(f"{t['filename']}: {truncate_middle(t['content'], 1000)}" for t in text_contents),
                 filename="", user_message=user_message, user_name=user_name
@@ -692,12 +696,12 @@ async def process_files(
         elif has_images:
             if "analyze_image" not in prompt_formats or "image_analysis" not in system_prompts:
                 raise ValueError("Missing required image analysis prompts")
-            prompt = prompt_formats["analyze_image"].format(
-                context=context,
+            rendered_user_content = prompt_formats["analyze_image"].format(
+                assembled_context=sanitized_assembled_context,
                 filename=", ".join(image_files),
                 user_message=user_message or PROMPTS.default_image_message,
                 user_name=user_name,
-            )
+            ).lstrip()
             system_prompt = (
                 system_prompts["image_analysis"]
                 .replace("{amygdala_response}", amygdala)
@@ -705,12 +709,12 @@ async def process_files(
             )
         elif has_audio:
             prompt_tpl = prompt_formats.get("analyze_audio")
-            prompt = prompt_tpl.format(
-                context=context,
+            rendered_user_content = prompt_tpl.format(
+                assembled_context=sanitized_assembled_context,
                 filename=", ".join(audio_files),
                 user_message=user_message or PROMPTS.default_audio_message,
                 user_name=user_name,
-            ) if prompt_tpl else _fallback_prompt("audio", context=context, filename=", ".join(audio_files), user_message=user_message, user_name=user_name)
+            ).lstrip() if prompt_tpl else _fallback_prompt("audio", assembled_context=sanitized_assembled_context, filename=", ".join(audio_files), user_message=user_message, user_name=user_name)
             system_prompt = (
                 system_prompts.get("audio_analysis", system_prompts["combined_analysis"])
                 .replace("{amygdala_response}", amygdala)
@@ -718,12 +722,12 @@ async def process_files(
             )
         elif has_video:
             prompt_tpl = prompt_formats.get("analyze_video")
-            prompt = prompt_tpl.format(
-                context=context,
+            rendered_user_content = prompt_tpl.format(
+                assembled_context=sanitized_assembled_context,
                 filename=", ".join(video_files),
                 user_message=user_message or PROMPTS.default_video_message,
                 user_name=user_name,
-            ) if prompt_tpl else _fallback_prompt("video", context=context, filename=", ".join(video_files), user_message=user_message, user_name=user_name)
+            ).lstrip() if prompt_tpl else _fallback_prompt("video", assembled_context=sanitized_assembled_context, filename=", ".join(video_files), user_message=user_message, user_name=user_name)
             system_prompt = (
                 system_prompts.get("video_analysis", system_prompts["combined_analysis"])
                 .replace("{amygdala_response}", amygdala)
@@ -735,13 +739,13 @@ async def process_files(
             combined_text = "\n\n".join(
                 f"=== {t['filename']} ===\n{t['content']}" for t in text_contents
             )
-            prompt = prompt_formats["analyze_file"].format(
-                context=context,
+            rendered_user_content = prompt_formats["analyze_file"].format(
+                assembled_context=sanitized_assembled_context,
                 filename=", ".join(t["filename"] for t in text_contents),
                 file_content=combined_text,
                 user_message=user_message,
                 user_name=user_name,
-            )
+            ).lstrip()
             system_prompt = (
                 system_prompts["file_analysis"]
                 .replace("{amygdala_response}", amygdala)
@@ -751,7 +755,7 @@ async def process_files(
         response_content = None
         async with adapter.thinking(msg.channel_id):
             response_content = await runtime.call_api(
-                prompt=prompt,
+                user_content=rendered_user_content,
                 system_prompt=system_prompt,
                 image_paths=(temp_paths + video_frame_paths) if (temp_paths or video_frame_paths) else None,
                 audio_paths=audio_paths if audio_paths else None,
@@ -890,14 +894,14 @@ async def generate_and_save_thought(
         memory_text,
     )
 
-    thought_prompt = prompt_formats["generate_thought"].format(
+    rendered_user_content = prompt_formats["generate_thought"].format(
         user_name=user_name,
         memory_text=temporal_memory_text,
         timestamp=temporal_timestamp,
         conversation_context=conversation_context,
     )
     if file_context:
-        thought_prompt += PROMPTS.file_context_suffix.format(file_context=file_context)
+        rendered_user_content += PROMPTS.file_context_suffix.format(file_context=file_context)
 
     themes = _themes_memoized(memory_index, user_id, mode="sections")
     thought_system_prompt = (
@@ -907,8 +911,7 @@ async def generate_and_save_thought(
     )
 
     thought_response = await runtime.call_api(
-        prompt=thought_prompt,
-        context="",
+        user_content=rendered_user_content,
         system_prompt=thought_system_prompt,
         image_paths=image_paths,
         audio_paths=audio_paths,

@@ -1,9 +1,9 @@
 """Shared models, globals, and utility functions for the TUI."""
 
-import os, sys, io, re, math, string, pickle, subprocess, contextlib, hashlib, json
+import os, sys, io, re, math, string, pickle, subprocess, contextlib, hashlib, json, threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
+from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING, Callable
 from collections import defaultdict
 import numpy as np
 
@@ -72,6 +72,81 @@ class BotInstance:
         return self.external_pid
 
 
+@dataclass
+class LiveBotContext:
+    """Read-only discovery hook for bot state hosted inside the TUI process.
+
+    The context does not own or mutate these objects.  Consumers must obtain a
+    consistent memory snapshot before doing work on another thread.
+    """
+
+    bot_name: str
+    memory_index: Any
+    runtime: Any = None
+    user_id: Optional[str] = None
+    theme_provider: Optional[Callable[[], dict]] = None
+    _snapshot_lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    def runtime_state(self) -> dict:
+        runtime = self.runtime
+        if runtime is None:
+            return {}
+        return {
+            "agent_name": getattr(runtime, "agent_name", self.bot_name),
+            "agent_id": getattr(runtime, "agent_id", None),
+            "amygdala_response": getattr(runtime, "amygdala_response", None),
+            "processing_enabled": getattr(runtime, "processing_enabled", None),
+            "user_id": self.user_id,
+            "transport": "tui-chat",
+        }
+
+    def snapshot_payload(self) -> dict:
+        """Return the common versioned live hook without mutating the index."""
+        from viz_live import make_live_payload
+
+        with self._snapshot_lock:
+            memory_index = self.memory_index
+            snapshot = getattr(memory_index, "_snapshot", None)
+            if callable(snapshot):
+                memory = snapshot()
+            else:
+                lock = getattr(memory_index, "_mut", None)
+                if lock is None:
+                    memory = {
+                        "memories": list(getattr(memory_index, "memories", [])),
+                        "user_memories": {
+                            key: list(value) for key, value in
+                            getattr(memory_index, "user_memories", {}).items()
+                        },
+                        "inverted_index": {
+                            key: list(value) for key, value in
+                            getattr(memory_index, "inverted_index", {}).items()
+                        },
+                    }
+                else:
+                    with lock:
+                        memory = {
+                            "memories": list(memory_index.memories),
+                            "user_memories": {
+                                key: list(value) for key, value in
+                                memory_index.user_memories.items()
+                            },
+                            "inverted_index": {
+                                key: list(value) for key, value in
+                                memory_index.inverted_index.items()
+                            },
+                        }
+            try:
+                themes = self.theme_provider() if self.theme_provider else {}
+            except Exception:
+                themes = {}
+        return make_live_payload(
+            memory,
+            runtime=self.runtime_state(),
+            themes=themes,
+        )
+
+
 class AppState:
     def __init__(self):
         self.selected_bot: Optional[str] = None
@@ -80,6 +155,8 @@ class AppState:
         self.dmn_api: Optional[str] = None
         self.dmn_model: Optional[str] = None
         self.instances: Dict[str, BotInstance] = {}
+        self._live_contexts: Dict[str, LiveBotContext] = {}
+        self._live_lock = threading.RLock()
 
     @property
     def running_count(self) -> int:
@@ -87,6 +164,49 @@ class AppState:
 
     def is_bot_running(self, bot_name: str) -> bool:
         return bot_name in self.instances and self.instances[bot_name].running
+
+    def register_live_context(
+        self,
+        bot_name: str,
+        memory_index: Any,
+        runtime: Any = None,
+        user_id: Optional[str] = None,
+        theme_provider: Optional[Callable[[], dict]] = None,
+    ) -> LiveBotContext:
+        """Publish in-process bot state for read-only secondary consumers."""
+        context = LiveBotContext(
+            bot_name, memory_index, runtime, user_id, theme_provider
+        )
+        with self._live_lock:
+            self._live_contexts[bot_name] = context
+        return context
+
+    def update_live_user(self, bot_name: str, user_id: Optional[str]) -> None:
+        with self._live_lock:
+            context = self._live_contexts.get(bot_name)
+            if context is not None:
+                context.user_id = user_id
+
+    def unregister_live_context(
+        self,
+        bot_name: str,
+        memory_index: Any = None,
+    ) -> None:
+        """Remove a context, optionally only when it still owns the index."""
+        with self._live_lock:
+            context = self._live_contexts.get(bot_name)
+            if context is None:
+                return
+            if memory_index is None or context.memory_index is memory_index:
+                del self._live_contexts[bot_name]
+
+    def get_live_context(self, bot_name: str) -> Optional[LiveBotContext]:
+        with self._live_lock:
+            return self._live_contexts.get(bot_name)
+
+    def live_bot_names(self) -> list[str]:
+        with self._live_lock:
+            return sorted(self._live_contexts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -574,37 +694,55 @@ class VizNode:
     grid_y: int = 0
 
 
-_SVD_COMPONENTS = 50  # latent dims before final PCA — captures global structure
+_SVD_COMPONENTS = 50  # latent dims before final projection
+VIZ_PIPELINE_VERSION = 2
+_VIZ_MIN_DF = 2
+_VIZ_MAX_DF_RATIO = 0.60
 
 
 def build_tfidf_vectors(cache: dict, memory_ids: List[int]) -> Tuple[Any, List[str], np.ndarray]:
-    """Build a sparse L2-normalised float32 TF-IDF matrix for the given memory IDs."""
+    """Build TF-IDF from the agent's surviving inverted-index associations.
+
+    The postings are authoritative: DMN decay removes individual memory/term
+    associations without rewriting memory text.  Singleton terms cannot form
+    graph edges and very common framing terms obscure topology, so both are
+    excluded unless that would leave the projection with no features.
+    """
     from scipy.sparse import csr_matrix, diags  # lazy — only loaded when viz is used
 
-    memories = cache["memories"]
     inv_idx  = cache["inverted_index"]
+    row_for_mid = {mid: row for row, mid in enumerate(memory_ids)}
+    valid_mids = set(row_for_mid)
+    total_docs = len(memory_ids)
+    max_df = max(_VIZ_MIN_DF, int(total_docs * _VIZ_MAX_DF_RATIO))
 
-    all_terms   = sorted(inv_idx.keys())
-    term_to_idx = {t: i for i, t in enumerate(all_terms)}
-    total_docs  = sum(1 for m in memories if m is not None)
+    term_postings = []
+    for term, postings in inv_idx.items():
+        scoped = [mid for mid in postings if mid in valid_mids]
+        df = len(set(scoped))
+        if _VIZ_MIN_DF <= df <= max_df:
+            term_postings.append((term, scoped, df))
 
-    idf_map = {
-        t: math.log((total_docs + 1) / (len(set(postings)) + 1)) + 1
-        for t, postings in inv_idx.items()
-    }
+    # Tiny or highly-pruned corpora still deserve a usable projection.
+    if not term_postings:
+        for term, postings in inv_idx.items():
+            scoped = [mid for mid in postings if mid in valid_mids]
+            if scoped:
+                term_postings.append((term, scoped, len(set(scoped))))
+
+    term_postings.sort(key=lambda item: item[0])
+    all_terms = [item[0] for item in term_postings]
 
     rows, cols, vals = [], [], []
-    for row, mid in enumerate(memory_ids):
-        if mid >= len(memories) or memories[mid] is None:
-            continue
-        tc: dict[str, int] = defaultdict(int)
-        for t in tokenize(memories[mid]):
-            tc[t] += 1
-        for t, count in tc.items():
-            if t in term_to_idx:
-                rows.append(row)
-                cols.append(term_to_idx[t])
-                vals.append(float(count) * idf_map[t])
+    for col, (_term, postings, df) in enumerate(term_postings):
+        counts = defaultdict(int)
+        for mid in postings:
+            counts[mid] += 1
+        idf = math.log((total_docs + 1) / (df + 1)) + 1
+        for mid, count in counts.items():
+            rows.append(row_for_mid[mid])
+            cols.append(col)
+            vals.append((1.0 + math.log(float(count))) * idf)
 
     sparse = csr_matrix(
         (vals, (rows, cols)),
@@ -624,33 +762,41 @@ def reduce_dimensions_sparse(sparse: Any, method: str = "pca") -> np.ndarray:
     """Reduce a sparse L2-normalised TF-IDF matrix to 2-D coordinates.
 
     Pipeline:
-      TruncatedSVD(50)  — sparse-native, finds global structure across full vocab
-      PCA(2) / UMAP(2)  — properly centered 2-D projection of those 50 dense dims
+      TruncatedSVD(50) — sparse-native latent semantic representation
+      LSA(2), PCA(2), or cosine UMAP(2) — selectable final projection
     """
     from sklearn.decomposition import TruncatedSVD, PCA  # lazy
-    from sklearn.preprocessing import StandardScaler      # lazy
 
     n_samples = sparse.shape[0]
     if n_samples < 2:
-        return np.zeros((n_samples, 2))
+        return np.zeros((n_samples, 2), dtype=np.float32)
+    if sparse.shape[1] == 0 or sparse.nnz == 0:
+        return np.zeros((n_samples, 2), dtype=np.float32)
 
-    n_svd = min(_SVD_COMPONENTS, n_samples - 1, sparse.shape[1] - 1)
+    n_svd = min(_SVD_COMPONENTS, n_samples - 1, sparse.shape[1])
+    if n_svd < 1:
+        return np.zeros((n_samples, 2), dtype=np.float32)
     reduced = TruncatedSVD(n_components=n_svd, random_state=42).fit_transform(sparse)
 
-    # Equalise SVD component contributions before final projection.
-    # Without this, the first singular vector dominates and PCA/UMAP collapses
-    # everything onto a single axis.
-    reduced = StandardScaler().fit_transform(reduced)
+    if method == "lsa":
+        if reduced.shape[1] == 1:
+            return np.column_stack((reduced[:, 0], np.zeros(n_samples)))
+        return reduced[:, :2]
 
     if method == "umap":
         import umap as _umap  # lazy — numba JIT only triggered on first viz with UMAP
+        if n_samples < 3:
+            return np.column_stack((reduced[:, 0], np.zeros(n_samples)))
         return _umap.UMAP(
             n_components=2,
-            n_neighbors=min(15, n_samples - 1),
+            n_neighbors=min(30, n_samples - 1),
             min_dist=0.1,
+            metric="cosine",
             random_state=42,
         ).fit_transform(reduced)
 
+    if reduced.shape[1] < 2:
+        return np.column_stack((reduced[:, 0], np.zeros(n_samples)))
     return PCA(n_components=2, random_state=42).fit_transform(reduced)
 
 
@@ -664,11 +810,27 @@ def _viz_cache_dir(bot_name: str) -> Path:
     return PATHS.cache_dir / bot_name / "viz_cache"
 
 
-def _viz_fingerprint(bot_name: str, method: str, memory_ids: List[int]) -> str:
-    """Fast, stable fingerprint for a (bot, method, memory_id_set) triple."""
+def _viz_fingerprint(
+    bot_name: str,
+    method: str,
+    memory_ids: List[int],
+    source_key: Optional[str] = None,
+) -> str:
+    """Fingerprint projection inputs, source cache state, and pipeline version."""
     ids_bytes = np.array(sorted(memory_ids), dtype=np.int32).tobytes()
     ids_hash  = hashlib.md5(ids_bytes).hexdigest()[:10]
-    key = f"{bot_name}:{method}:{len(memory_ids)}:{ids_hash}"
+    if source_key is None:
+        try:
+            stat = PATHS.bot_memory(bot_name).stat()
+            source = f"disk:{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            source = "disk:missing"
+    else:
+        source = source_key
+    key = (
+        f"v{VIZ_PIPELINE_VERSION}:{bot_name}:{method}:"
+        f"{len(memory_ids)}:{ids_hash}:{source}"
+    )
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
@@ -678,12 +840,13 @@ def save_viz_cache(
     memory_ids: List[int],
     coords: np.ndarray,
     mags: np.ndarray,
+    source_key: Optional[str] = None,
 ) -> bool:
     """Persist 2-D coords + magnitudes to a compressed .npz file."""
     try:
         cache_dir = _viz_cache_dir(bot_name)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        fp = _viz_fingerprint(bot_name, method, memory_ids)
+        fp = _viz_fingerprint(bot_name, method, memory_ids, source_key)
         np.savez_compressed(
             str(cache_dir / f"{fp}.npz"),
             coords=coords.astype(np.float32),
@@ -691,7 +854,11 @@ def save_viz_cache(
             memory_ids=np.array(memory_ids, dtype=np.int32),
         )
         (cache_dir / f"{fp}.meta.json").write_text(
-            json.dumps({"bot": bot_name, "method": method, "n": len(memory_ids), "fp": fp}),
+            json.dumps({
+                "bot": bot_name, "method": method, "n": len(memory_ids),
+                "fp": fp, "pipeline": VIZ_PIPELINE_VERSION,
+                "source_key": source_key,
+            }),
             encoding="utf-8",
         )
         return True
@@ -703,10 +870,11 @@ def load_viz_cache(
     bot_name: str,
     method: str,
     memory_ids: List[int],
+    source_key: Optional[str] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """Load cached (coords, mags) if a valid file exists, else return None."""
     try:
-        fp      = _viz_fingerprint(bot_name, method, memory_ids)
+        fp      = _viz_fingerprint(bot_name, method, memory_ids, source_key)
         npz_path = _viz_cache_dir(bot_name) / f"{fp}.npz"
         if not npz_path.exists():
             return None
@@ -735,12 +903,16 @@ def find_connections(
     if mid >= len(memories) or memories[mid] is None:
         return []
 
-    source_toks = set(tokenize(memories[mid]))
+    # Only terms whose posting list still contains this memory are live edges.
+    source_toks = {
+        term for term in tokenize(memories[mid])
+        if mid in inv_idx.get(term, ())
+    }
     connections = defaultdict(lambda: {"score": 0.0, "terms": []})
 
-    for term in source_toks:
+    for term in sorted(source_toks):
         if term in inv_idx:
-            for other_mid in inv_idx[term]:
+            for other_mid in set(inv_idx[term]):
                 if other_mid == mid:
                     continue
                 if other_mid >= len(memories) or memories[other_mid] is None:
@@ -751,7 +923,10 @@ def find_connections(
                 connections[other_mid]["terms"].append(term)
 
     for other_mid in connections:
-        other_toks = set(tokenize(memories[other_mid]))
+        other_toks = {
+            term for term in tokenize(memories[other_mid])
+            if other_mid in inv_idx.get(term, ())
+        }
         union_size = len(source_toks | other_toks)
         if union_size > 0:
             connections[other_mid]["score"] = len(connections[other_mid]["terms"]) / union_size
@@ -868,7 +1043,7 @@ def _draw_line(grid: List[List[str]], x1: int, y1: int, x2: int, y2: int, width:
     else:
         char = "╱"
 
-    _density = {"░", "▒", "▓"}
+    _density = {"░", "▒", "▓", "█", "·", "∘"}
     _lines = {"─", "│", "╲", "╱"}
 
     x, y = float(x1), float(y1)
@@ -876,7 +1051,8 @@ def _draw_line(grid: List[List[str]], x1: int, y1: int, x2: int, y2: int, width:
         ix, iy = int(round(x)), int(round(y))
         if 0 <= ix < width and 0 <= iy < height:
             cur = grid[iy][ix]
-            if cur == " " or cur in _density:
+            is_braille = len(cur) == 1 and 0x2800 <= ord(cur) <= 0x28FF
+            if cur == " " or cur in _density or is_braille:
                 grid[iy][ix] = char
             elif cur in _lines and cur != char:
                 grid[iy][ix] = "┼"

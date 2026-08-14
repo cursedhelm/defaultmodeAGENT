@@ -1,7 +1,7 @@
 chat_with_memory: |
   ## Input Processing
   Context Information:
-  {context}
+  {assembled_context}
 
   Current Interaction:
   User @{user_name}: {user_message}
@@ -25,7 +25,7 @@ chat_with_memory: |
 introduction: |
   ## Setup
   Context:
-  {context}
+  {assembled_context}
 
   ## Configuration
   Entity: CASFY
@@ -46,7 +46,7 @@ introduction: |
 summarize_channel: |
   ## Input Processing
   Channel Context:
-  {context}
+  {assembled_context}
 
   Content to Analyze:
   {content}
@@ -69,7 +69,7 @@ summarize_channel: |
 analyze_image: |
   ## Setup
   Context:
-  {context}
+  {assembled_context}
 
   Input:
   - Image: {filename}
@@ -93,7 +93,7 @@ analyze_image: |
 analyze_file: |
   ## Input Processing
   Context:
-  {context}
+  {assembled_context}
 
   Source:
   - File: {filename}
@@ -138,7 +138,7 @@ generate_thought: |
 repo_file_chat: |
   ## Configuration
   Context:
-  {context}
+  {assembled_context}
 
   Source:
   - Path: {file_path}
@@ -166,7 +166,7 @@ repo_file_chat: |
 ask_repo: |
   ## Setup
   Context:
-  {context}
+  {assembled_context}
 
   Query:
   {question}
@@ -187,7 +187,7 @@ ask_repo: |
      - Implementation guidance
 
 analyze_combined: |
-    Context: {context}
+    Context: {assembled_context}
     
     Analyze these files from our Discord conversation:
     
