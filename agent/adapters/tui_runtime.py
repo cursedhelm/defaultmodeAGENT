@@ -44,6 +44,13 @@ class TUIRuntime:
         from logger import BotLogger
         self._log = BotLogger(bot_name)
 
+        from bot_config import config
+        from tools.todos.factory import create_todo_service
+        self.todo_service = (
+            create_todo_service(config.todo, mod.get_embeddings, self._log)
+            if config.todo.enabled else None
+        )
+
     # ── AgentRuntime identity ──────────────────────────────────────────────────
 
     @property
@@ -91,6 +98,31 @@ class TUIRuntime:
 
     async def call_api(self, **kwargs) -> str:
         return await self._api.call_api(**kwargs)
+
+    def build_tools_for_message(self, msg):
+        if self.todo_service is None:
+            return None
+        from tools.todos.models import Principal, TodoRequestContext
+        from tools.todos.toolset import build_todo_tool_bundle
+
+        raw_actor_id = str(msg.author_id)
+        actor_key = (
+            f"discord:{raw_actor_id}"
+            if raw_actor_id.isdigit()
+            else f"tui-user:{raw_actor_id.replace(':', '_')}"
+        )
+        actor = Principal(
+            key=actor_key,
+            display_name=msg.author_name or str(msg.author_id),
+        )
+        agent = Principal(key=f"tui:{self._agent_name}", display_name=self._agent_name, is_bot=True)
+        context = TodoRequestContext(
+            actor=actor,
+            agent=agent,
+            channel_id=str(msg.channel_id),
+            source="tui",
+        )
+        return build_todo_tool_bundle(self.todo_service, context)
 
     def update_api_temperature(self, temperature: float) -> None:
         self._api.update_api_temperature(temperature)

@@ -13,6 +13,7 @@ from chunker import truncate_middle
 from discord_utils import sanitize_mentions
 from hippocampus import Hippocampus, HippocampusConfig
 from bot_config import config
+from tokenizer import count_tokens
 
 
 class ContextPrompts(BaseModel):
@@ -85,12 +86,40 @@ def process_history_dual(msgs, reactions_map, temporal_parser, truncation_len, h
     return '\n'.join(simple_lines), formatted_list
 
 
-def build_memory_context(relevant_memories, temporal_parser, truncation_len):
-    """format memories with temporal parsing"""
+def fit_ranked_entries(entries, header_template, footer="", max_tokens=None):
+    """Fit ranked, already-rendered entries into a final prompt budget.
+
+    Entries that do not fit are skipped so one large item cannot hide shorter,
+    lower-ranked items.  Counting the complete prospective block also includes
+    framing overhead and avoids relying on token-count additivity.
+    """
+    if not entries:
+        return ""
+
+    selected = []
+    for entry in entries:
+        prospective = header_template.format(count=len(selected) + 1)
+        prospective += "".join((*selected, entry))
+        prospective += footer
+        if max_tokens is None or count_tokens(prospective) <= max_tokens:
+            selected.append(entry)
+
+    if not selected:
+        return ""
+    return header_template.format(count=len(selected)) + "".join(selected) + footer
+
+
+def build_memory_context(
+    relevant_memories,
+    temporal_parser,
+    truncation_len,
+    max_tokens=None,
+):
+    """Format ranked memories, then enforce the final prompt-token budget."""
     if not relevant_memories:
         return ""
-    ctx = PROMPTS.memory_block_header.format(count=len(relevant_memories))
     timestamp_pattern = r'\((\d{2}):(\d{2})\s*\[(\d{2}/\d{2}/\d{2})\]\)'
+    entries = []
     for memory, score in relevant_memories:
         parsed = re.sub(
             timestamp_pattern,
@@ -98,9 +127,13 @@ def build_memory_context(relevant_memories, temporal_parser, truncation_len):
             memory
         )
         truncated = truncate_middle(parsed, max_tokens=truncation_len)
-        ctx += PROMPTS.memory_entry.format(score=score, memory=truncated)
-    ctx += PROMPTS.memory_block_footer
-    return ctx
+        entries.append(PROMPTS.memory_entry.format(score=score, memory=truncated))
+    return fit_ranked_entries(
+        entries,
+        PROMPTS.memory_block_header,
+        PROMPTS.memory_block_footer,
+        max_tokens=max_tokens,
+    )
 
 
 def build_conversation_context(formatted_msgs):

@@ -431,7 +431,8 @@ class SpikeProcessor:
 
         memory_context = build_memory_context(
             relevant_memories, self.temporal_parser,
-            bot_config.conversation.truncation_length
+            bot_config.conversation.truncation_length,
+            max_tokens=getattr(self.memory_index, "max_tokens", bot_config.search.max_tokens),
         )
 
         # --- spike-specific prompt assembly ---

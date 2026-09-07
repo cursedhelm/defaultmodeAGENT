@@ -6,6 +6,7 @@ from datetime import datetime
 import re
 from pydantic import BaseModel, Field
 from chunker import truncate_middle, clean_response
+from context import fit_ranked_entries
 from temporality import TemporalParser
 from thinking_trace import separate_thinking_traces, store_thinking_traces
 from fuzzywuzzy import fuzz
@@ -279,19 +280,24 @@ class DMNProcessor:
             'related_memories_count': len(related_memories)
         })
 
-        # Build memory context using ALL related memories
-        memory_context = PROMPTS.connected_memories_header.format(count=len(related_memories))
-        if related_memories:
-            for memory, score in sorted(related_memories, key=lambda x: x[1], reverse=True):
-                # Convert any timestamp in the memory to temporal expression
-                timestamp_pattern = r'\((\d{2}):(\d{2})\s*\[(\d{2}/\d{2}/\d{2})\]\)'
-                
-                parsed_memory = re.sub(timestamp_pattern, 
-                    lambda m: f"({self.temporal_parser.get_temporal_expression(datetime.strptime(f'{m.group(1)}:{m.group(2)} {m.group(3)}', '%H:%M %d/%m/%y')).base_expression})", 
-                    memory)
-                memory_context += PROMPTS.memory_entry.format(memory=parsed_memory, score=score)
-        else:
-            memory_context += PROMPTS.empty_recall
+        # Render the ranked memories first, then apply the prompt budget. Search
+        # itself deliberately works by candidate count so long source memories
+        # cannot prevent shorter relevant candidates from being considered.
+        memory_entries = []
+        timestamp_pattern = r'\((\d{2}):(\d{2})\s*\[(\d{2}/\d{2}/\d{2})\]\)'
+        for memory, score in sorted(related_memories, key=lambda x: x[1], reverse=True):
+            parsed_memory = re.sub(timestamp_pattern,
+                lambda m: f"({self.temporal_parser.get_temporal_expression(datetime.strptime(f'{m.group(1)}:{m.group(2)} {m.group(3)}', '%H:%M %d/%m/%y')).base_expression})",
+                memory)
+            truncated_memory = truncate_middle(parsed_memory, self.max_memory_length)
+            memory_entries.append(PROMPTS.memory_entry.format(memory=truncated_memory, score=score))
+        memory_context = fit_ranked_entries(
+            memory_entries,
+            PROMPTS.connected_memories_header,
+            max_tokens=self.memory_index.max_tokens,
+        )
+        if not memory_context:
+            memory_context = PROMPTS.empty_recall
 
         # Get high-similarity memories for term processing
         similar_memories = []
@@ -425,9 +431,6 @@ class DMNProcessor:
             '{amygdala_response}',
             str(self.amygdala_response)
         )
-        # truncate the middle of each memory in the memory_context using truncate_middle
-        memory_context = "\n\n".join([truncate_middle(memory, self.max_memory_length) for memory in memory_context.split("\n\n")])
-
         try:
             if self.use_chronpression and _chronomic_filter is not None:
                 chron_compression = 0.5 + intensity_norm * (self.chron_compression_max - 0.5)

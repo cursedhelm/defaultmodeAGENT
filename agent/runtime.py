@@ -97,6 +97,10 @@ class AgentRuntime(Protocol):
 
     def update_api_top_p(self, top_p: float) -> None: ...
 
+    def build_tools_for_message(self, msg: Any) -> Any:
+        """Return a request-bound tool bundle for a direct foreground turn."""
+        ...
+
     # ------------------------------------------------------------------ #
     # Subsystems                                                           #
     # ------------------------------------------------------------------ #

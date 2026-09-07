@@ -181,6 +181,39 @@ python run_bot.py
 
 **supported APIs:** `ollama` · `openai` · `anthropic` · `gemini` · `vllm` · `openrouter`
 
+### shared todo tools
+
+Foreground conversations expose request-bound todo tools to the selected model. The
+agent can maintain its own list, maintain the requester's list when asked, and access
+another mentioned user only when that user has granted access (or the requester is a
+configured Discord manager). DMN, spike, reflection, and other background calls do
+not receive these tools.
+
+Discord commands:
+
+```text
+!todo                  view your list
+!todo <text>           add an item
+!goal <text>           set the goal used for semantic ranking
+!todont <selector>     remove by number, text, ID, or confident semantic match
+!clear_todos confirm   clear your goal and items
+/todo ...              slash commands, including target users and sharing
+```
+
+State is stored transactionally in `cache/shared/todos.sqlite3`. Configure the store
+and its independent embedding provider with the `TODO_*` variables shown in
+`.env.example`. Multiple bots can use the same database: Discord users have one
+shared list, each bot has its own list keyed by bot ID, and audit entries record both
+the requester and executing bot. The first bot to initialize an empty database sets
+the canonical ranking profile so bots with different local model settings cannot
+reorder the shared lists inconsistently. Legacy todont Markdown can be imported once
+with:
+
+```bash
+cd agent
+python -m tools.todos.migration <path-to-todont-cache/todobot/lists> --database ../cache/shared/todos.sqlite3
+```
+
 ---
 
 # run_bot — TUI manager

@@ -11,7 +11,6 @@ import time
 from collections import defaultdict,Counter
 from datetime import datetime,timedelta
 from bot_config import config
-from tokenizer import get_tokenizer,count_tokens as _ct
 from logger import logging
 
 MAX_TOKENS=config.search.max_tokens
@@ -144,7 +143,6 @@ class UserMemoryIndex:
         self.cache_manager=CacheManager(self.bot_name)
         self.cache_dir=self.cache_manager.get_cache_dir(cache_subtype)
         self.max_tokens=max_tokens; self.context_chunks=context_chunks
-        self.tokenizer=get_tokenizer()
         self.inverted_index=defaultdict(list); self.memories=[]; self.user_memories=defaultdict(list)
         self.stopwords=set(['the','a','an','and','or','but','nor','yet','so','in','on','at','to','for','of','with','by','from','up','about','i','you','he','she','it','we','they','me','him','her','us','them','is','are','was','were','be','been','have','has','had','can','could','may','might','must','shall','should','will','would','this','that','these','those'])
         self._global_stops: set = set()
@@ -172,9 +170,6 @@ class UserMemoryIndex:
             if w.isdigit() and len(w)!=4:continue
             out.append(w)
         return ' '.join(out)
-    def _safe_ct(self,t):
-        try: return _ct(t)
-        except: return len(t.split()) if isinstance(t,str) else 0
     def _on_save_complete(self,path):
         try: self._cache_mtime=os.path.getmtime(path)
         except OSError: pass
@@ -288,17 +283,18 @@ class UserMemoryIndex:
             mx=max(scores.values()) if scores else 1.0
             for mid in list(scores.keys()): scores[mid]/=mx
             sm=sorted(scores.items(),key=lambda x:x[1],reverse=True)
-            res=[]; toks=0; seen=set()
+            # Retrieval is bounded by candidate count, not by the original text
+            # size.  Hippocampus compresses candidates for embedding and the
+            # final prompt builder applies the real context-token budget.
+            res=[]; seen=set()
             for mid,sc in sm:
                 m=self.memories[mid]
                 if m is None: continue
-                mt=self._safe_ct(m)
-                if toks+mt>self.max_tokens: break
                 cm=self.clean_text(m); dup=False
                 for s in seen:
                     if self._calculate_similarity(cm,s)>dedup_threshold: dup=True; break
                 if not dup:
-                    res.append((m,sc)); seen.add(cm); toks+=mt
+                    res.append((m,sc)); seen.add(cm)
                     if len(res)>=k: break
         self.logger.info(f"mem.search q='{query[:256]}' got={len(res)}")
         return res

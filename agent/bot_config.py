@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from typing import ClassVar, Set, Dict
+from typing import ClassVar, Set, Dict, Literal
 from logger import BotLogger
 from datetime import datetime, timedelta
 import discord
@@ -213,6 +213,18 @@ class HippocampusConfig(BaseModel):
     embedding_model: str = Field(default='all-minilm:latest', description="Model to use for embeddings")
     blend_factor: float = Field(default=0.7, description="Weight for blending initial search scores with embedding similarity (0-1)")
 
+class TodoConfig(BaseModel):
+    """Shared todo service, ranking, and migration configuration."""
+    enabled: bool = Field(default=os.getenv('TODO_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    database_path: str = Field(default=os.getenv('TODO_DATABASE_PATH', 'cache/shared/todos.sqlite3'), min_length=1)
+    max_items: int = Field(default=int(os.getenv('TODO_MAX_ITEMS', '5')), ge=1, le=100)
+    embedding_provider: Literal['openai', 'openrouter', 'ollama', 'llama-server', 'vllm', 'unsloth', 'gemini'] = Field(default=os.getenv('TODO_EMBED_PROVIDER', 'ollama'))
+    embedding_model: str = Field(default=os.getenv('TODO_EMBED_MODEL', 'all-minilm:latest'), min_length=1)
+    max_embed_tokens: int = Field(default=int(os.getenv('TODO_MAX_EMBED_TOKENS', '256')), ge=8)
+    semantic_remove_threshold: float = Field(default=float(os.getenv('TODO_REMOVE_THRESHOLD', '0.55')), ge=-1.0, le=1.0)
+    semantic_ambiguity_margin: float = Field(default=float(os.getenv('TODO_AMBIGUITY_MARGIN', '0.05')), ge=0.0, le=2.0)
+    import_directory: str | None = Field(default=os.getenv('TODO_IMPORT_DIRECTORY') or None)
+
 class DiscordConfig(BaseModel):
     """Discord-specific configuration"""
     channel_id: str = Field(default=os.getenv('DISCORD_CHANNEL_ID'))
@@ -224,7 +236,7 @@ class DiscordConfig(BaseModel):
     system_commands: Set[str] = Field(default={ 'kill', 'resume', 'get_logs', 'dmn', 'mentions', 'persona', 'search_memories', 'spike' })
     management_commands: Set[str] = Field(default={ 'add_memory', 'index_repo', 'reranking', 'clear_memories', 'attention', 'spike' })
     general_commands: Set[str] = Field(default={ 'summarize', 'ask_repo', 'repo_file_chat', 'analyze_file' })
-    bot_action_commands: Set[str] = Field(default={ 'help', 'dmn', 'persona', 'add_memory', 'ask_repo', 'search_memories', 'kill', 'attention' })
+    bot_action_commands: Set[str] = Field(default={ 'help', 'dmn', 'persona', 'add_memory', 'ask_repo', 'search_memories', 'kill', 'attention', 'todo', 'goal', 'todont' })
 
     def has_command_permission(self, command_name: str, ctx) -> bool:
         if command_name not in (
@@ -351,6 +363,7 @@ class BotConfig(BaseModel):
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     dmn: DMNConfig = Field(default_factory=DMNConfig)
     spike: SpikeConfig = Field(default_factory=SpikeConfig)
+    todo: TodoConfig = Field(default_factory=TodoConfig)
 
 # Create global config instance
 config = BotConfig()

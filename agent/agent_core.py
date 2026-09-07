@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import os
 import re
 import traceback
@@ -32,6 +33,23 @@ from thinking_trace import separate_thinking_traces, store_thinking_traces
 from tools.webSCRAPE import scrape_webpage
 from tools.anyDOCER import decode_and_compress, is_document
 from attention import format_themes_for_prompt
+
+
+async def _foreground_tool_kwargs(runtime: AgentRuntime, msg: NormalizedMessage) -> dict:
+    """Build request-bound tools only for user-facing turns."""
+    factory = getattr(runtime, "build_tools_for_message", None)
+    if factory is None:
+        return {}
+    bundle = factory(msg)
+    if inspect.isawaitable(bundle):
+        bundle = await bundle
+    if bundle is None or not getattr(bundle, "specs", None):
+        return {}
+    return {
+        "tools": bundle.specs,
+        "tool_runtime": bundle.runtime,
+        "auto_execute_tools": True,
+    }
 
 
 class CorePrompts(BaseModel):
@@ -266,6 +284,7 @@ async def process_message(
             relevant_memories,
             _temporal_parser,
             TRUNCATION_LENGTH,
+            max_tokens=getattr(memory_index, "max_tokens", config.search.max_tokens),
         )
 
         url_ctx, url_errors, url_image_paths = _build_url_context(
@@ -293,11 +312,13 @@ async def process_message(
 
         response_content = None
         async with adapter.thinking(msg.channel_id):
+            tool_kwargs = await _foreground_tool_kwargs(runtime, msg)
             response_content = await runtime.call_api(
                 user_content=rendered_user_content,
                 system_prompt=system_prompt,
                 temperature=runtime.amygdala_response / 100,
                 image_paths=url_image_paths if url_image_paths else None,
+                **tool_kwargs,
             )
             response_content, thinking_traces = separate_thinking_traces(response_content)
             await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)
@@ -754,12 +775,14 @@ async def process_files(
 
         response_content = None
         async with adapter.thinking(msg.channel_id):
+            tool_kwargs = await _foreground_tool_kwargs(runtime, msg)
             response_content = await runtime.call_api(
                 user_content=rendered_user_content,
                 system_prompt=system_prompt,
                 image_paths=(temp_paths + video_frame_paths) if (temp_paths or video_frame_paths) else None,
                 audio_paths=audio_paths if audio_paths else None,
                 temperature=runtime.amygdala_response / 100,
+                **tool_kwargs,
             )
             response_content, thinking_traces = separate_thinking_traces(response_content)
             await store_thinking_traces(memory_index, user_id, user_name, thinking_traces)

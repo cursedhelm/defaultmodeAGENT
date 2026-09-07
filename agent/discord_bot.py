@@ -20,6 +20,11 @@ import traceback
 # import tools
 from tools.discordSUMMARISER import ChannelSummarizer
 from tools.discordGITHUB import GitHubRepo, RepoIndex, process_repo_contents, repo_processing_event
+from tools.todos.factory import create_todo_service
+from tools.todos.migration import migrate_todont_directory
+from tools.todos.models import Principal, TodoRequestContext
+from tools.todos.toolset import build_todo_tool_bundle
+from tools.todos.discord_commands import register_todo_commands
 # import memory module
 from memory import UserMemoryIndex, CacheManager
 from defaultmode import DMNProcessor
@@ -32,6 +37,7 @@ from attention import check_attention_triggers_fuzzy, format_themes_for_prompt, 
 from viz_live import VizLiveServer, make_live_payload
 # Action generation
 from spike import SpikeProcessor
+from discord_api_worker import DiscordAPIWorker
 # Configuration imports
 from bot_config import (
     config,
@@ -597,6 +603,54 @@ def setup_bot(prompt_path=None, bot_id=None):
     bot.mentions_enabled = False
     bot.attention_enabled = True
     bot._slash_commands_synced = False
+    bot.todo_service = None
+
+    def _is_todo_manager(author) -> bool:
+        permissions = getattr(author, 'guild_permissions', None)
+        if permissions and (permissions.administrator or permissions.manage_guild):
+            return True
+        return any(
+            role.name == config.discord.bot_manager_role
+            for role in getattr(author, 'roles', [])
+        )
+
+    def _principal(user) -> Principal:
+        return Principal(
+            key=f"discord:{user.id}",
+            display_name=getattr(user, 'display_name', None) or user.name,
+            is_bot=bool(getattr(user, 'bot', False)),
+        )
+
+    def _build_tools_for_message(msg):
+        if not config.todo.enabled or bot.todo_service is None or msg.raw is None:
+            return None
+        raw = msg.raw
+        actor = _principal(raw.author)
+        agent = _principal(bot.user)
+        targets = {}
+        users = list(getattr(raw, 'mentions', []) or [])
+        if msg.reply_to is not None and msg.reply_to.raw is not None:
+            users.append(msg.reply_to.raw.author)
+        for user in users:
+            principal = _principal(user)
+            targets[str(user.id)] = principal
+            targets[principal.key] = principal
+            targets[principal.display_name.casefold()] = principal
+            targets[getattr(user, 'name', principal.display_name).casefold()] = principal
+        context = TodoRequestContext(
+            actor=actor,
+            agent=agent,
+            guild_id=str(raw.guild.id) if getattr(raw, 'guild', None) else None,
+            channel_id=str(raw.channel.id),
+            is_manager=_is_todo_manager(raw.author),
+            source="agent_tool",
+            known_targets=targets,
+        )
+        return build_todo_tool_bundle(bot.todo_service, context)
+
+    bot.build_tools_for_message = _build_tools_for_message
+    if config.todo.enabled:
+        register_todo_commands(bot, config)
 
     # AgentRuntime helpers — satisfy runtime.AgentRuntime protocol
     async def _resolve_user(user_id: str) -> str:
@@ -1414,11 +1468,29 @@ if __name__ == "__main__":
         config.dmn.dmn_model = args.dmn_model or config.dmn.dmn_model
         #logger.info(f"DMN API overridden: {config.dmn.dmn_api_type}, Model: {config.dmn.dmn_model}")
     bot = setup_bot(prompt_path=prompt_path, bot_id=args.bot_name)
+    # Keep every Discord-triggered inference path off the gateway event loop.
+    # All channel, reflection, DMN, spike, summary, and repo calls share this
+    # async facade and are serialized on its dedicated worker thread.
+    api_worker = DiscordAPIWorker(
+        private_api.call_api,
+        private_api.api,
+        name=args.bot_name or "default",
+    )
     # Attach per-bot API handles
     bot.api = private_api.api
-    bot.call_api = private_api.call_api
+    bot.api_worker = api_worker
+    bot.call_api = api_worker.call_api
     bot.update_api_temperature = private_api.update_api_temperature
     bot.update_api_top_p = private_api.update_api_top_p
+    if config.todo.enabled:
+        bot.todo_service = create_todo_service(
+            config.todo, private_api.get_embeddings, bot.logger
+        )
+        if config.todo.import_directory:
+            migration_result = asyncio.run(
+                migrate_todont_directory(bot.todo_service, config.todo.import_directory)
+            )
+            bot.logger.info(f"Todo migration: {migration_result}")
     # Initialize DMN processor after API client is attached
     bot.dmn_processor = DMNProcessor(
         memory_index=bot.memory_index,
@@ -1476,3 +1548,5 @@ if __name__ == "__main__":
     finally:
         if bot._viz_live_server is not None:
             bot._viz_live_server.stop()
+        api_worker.shutdown()
+        private_api.shutdown_api_logger()
