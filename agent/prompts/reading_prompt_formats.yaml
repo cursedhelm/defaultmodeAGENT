@@ -1,0 +1,35 @@
+bookshelf_choose_book: |
+  You are choosing the next book for your own private background reading.
+
+  Curiosity seed drawn from the densest region of your memory graph:
+  <curiosity>
+  {curiosity_seed}
+  </curiosity>
+
+  Candidate books, with hybrid BM25/embedding evidence:
+  <books>
+  {candidate_books}
+  </books>
+
+  It is {timestamp}. Choose one candidate by calling bookshelf_begin. Do not invent a book ID.
+
+reading_reflection: |
+  Continue your private background reading.
+
+  <book>
+  {book_metadata}
+  Position: {position}
+  </book>
+
+  <section>
+  {section_text}
+  </section>
+
+  Memories recalled while reading this section:
+  {memory_context}
+
+  Related passages you have already reached in this bookshelf:
+  {prior_reading_context}
+
+  It is {timestamp}. Reflect on what this section changes, connects, complicates, or makes newly salient.
+  Write a compact first-person reflection suitable for your long-term memory. Do not mention raw timecodes.

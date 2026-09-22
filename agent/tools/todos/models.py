@@ -60,7 +60,7 @@ class TodoRequestContext(TodoModel):
     guild_id: str | None = None
     channel_id: str | None = None
     is_manager: bool = False
-    source: Literal["agent_tool", "discord_command", "tui"] = "agent_tool"
+    source: Literal["agent_tool", "discord_command", "tui", "spike"] = "agent_tool"
     known_targets: dict[str, Principal] = Field(default_factory=dict)
 
     def target(self, selector: str | None, *, default: Literal["agent", "requester"] = "agent") -> Principal:

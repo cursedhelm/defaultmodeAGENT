@@ -26,6 +26,7 @@ tests/*
 !tests/test_api_provider_contracts.py
 !tests/test_discord_api_worker.py
 !tests/test_memory_budgeting.py
+!tests/test_log_export.py
 todo/
 
 # python cache folders

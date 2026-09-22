@@ -11,7 +11,7 @@ class TodoPolicy:
         if owner_key == context.actor.key:
             return True
         if owner_key == context.agent.key:
-            return context.source in {"agent_tool", "tui"} or context.is_manager
+            return context.source in {"agent_tool", "tui", "spike"} or context.is_manager
         if context.is_manager:
             return True
         return repository.has_grant(owner_key, context.actor.key, {"view", "edit"})
@@ -21,7 +21,7 @@ class TodoPolicy:
         if owner_key == context.actor.key:
             return True
         if owner_key == context.agent.key:
-            return context.source in {"agent_tool", "tui"} or context.is_manager
+            return context.source in {"agent_tool", "tui", "spike"} or context.is_manager
         if context.is_manager:
             return True
         return repository.has_grant(owner_key, context.actor.key, {"edit"})

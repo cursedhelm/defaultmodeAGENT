@@ -1,0 +1,40 @@
+spike_action_selection: |
+  <seeking>
+  an association belonging to @{source_user} can no longer resolve inside the memory index:
+
+  {memory}
+  </seeking>
+
+  <recent_surfaces>
+  {surface_context}
+  </recent_surfaces>
+
+  <related_users>
+  {related_users}
+  </related_users>
+
+  it is {timestamp}. choose a bounded action by calling an available function.
+  you may reach one eligible recent channel, message one eligible related user,
+  use an agent tool, search the source user's memories with a query you generate,
+  or explicitly choose silence. do not answer with an unexecuted command.
+
+spike_action_reflection: |
+  <unresolved_association>
+  {memory}
+  </unresolved_association>
+
+  <seeking_action>
+  {action_context}
+  </seeking_action>
+
+  <result>
+  {result_context}
+  </result>
+
+  <grounding>
+  {grounding_context}
+  </grounding>
+
+  it is {timestamp}. reflect on what this action revealed, including silence or
+  failure. distinguish evidence sourced outside the original association from
+  echoes created by the action itself.

@@ -1,45 +1,24 @@
-'''
-## memory flow
-spike triggered
-    │
-    └─► find_target()
-            │
-            ├─► prefetch_surfaces() (batch fetch all channels)
-            ├─► compress_surface_from_buffer() + score_match() per surface
-            │
-            └─► winner surface found
-                    │
-                    └─► process_spike()
-                            │
-                            ├─► fetch_history_with_reactions + rerank_if_enabled (shared pipeline)
-                            │       │
-                            │       ├─► search_key = compressed_context + orphaned_memory
-                            │       ├─► memory_index.search_async(combined_key, k=12)
-                            │       ├─► hippocampus reranking (shared with discord_bot)
-                            │       ├─► temporal parse timestamps
-                            │       └─► return <memories> block (identical format to process_message)
-                            │
-                            ├─► prompt = orphan + memory_context + conversation_context
-                            ├─► call api (main bot api, no override)
-                            ├─► send response
-                            ├─► store interaction memory under bot.user.id
-                            └─► _reflect_on_spike() (background task)
-                                    │
-                                    ├─► call api (generate_thought / thought_generation)
-                                    └─► store reflection memory under bot.user.id
+"""Energy-bounded SEEKING for associations the DMN can no longer resolve.
 
-'''
+Each episode exposes only eligible Discord surfaces, related users, scoped
+memory search, and the agent's authorized background tools. Its action and
+private reflection are persisted through a SQLite outbox before graph cleanup.
+"""
 
 
 import asyncio
+import hashlib
+import json
 import os
 import pickle
 import threading
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Set, Tuple
+from pathlib import Path
+from typing import Any, Optional, List, Dict, Set, Tuple
 from dataclasses import dataclass, field
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+import yaml
 import re
 from tools.chronpression import chronomic_filter
 from chunker import truncate_middle, clean_response
@@ -49,6 +28,13 @@ from temporality import TemporalParser
 from thinking_trace import separate_thinking_traces, store_thinking_traces
 from bot_config import config as bot_config
 from memory import AtomicSaver
+from api_schema import ToolSpec
+from tools.bundle import AgentToolBundle, merge_tool_bundles
+from tools.bookshelf.toolset import build_bookshelf_tool_bundle
+from tools.todos.models import Principal, TodoRequestContext
+from tools.todos.toolset import build_todo_tool_bundle
+from tools.spike.models import SpikeActionEvent, SpikeActionOutcome, SpikeExecution
+from tools.spike.repository import SpikeRepository
 from context import (
     fetch_history_with_reactions,
     process_history_dual,
@@ -90,6 +76,19 @@ class SpikePrompts(BaseModel):
 PROMPTS = SpikePrompts()
 
 
+class SpikeToolInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SpikeSearchInput(SpikeToolInput):
+    user_id: str
+    query: str = Field(min_length=3, max_length=1000)
+
+
+class SpikeSilenceInput(SpikeToolInput):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 @dataclass
 class Surface:
     channel: discord.abc.Messageable
@@ -128,15 +127,46 @@ class SpikeProcessor:
         self.memory_index = memory_index
         self.config = bot_config.spike
         self.last_spike: datetime = datetime.min
-        self.enabled: bool = True
+        self.enabled: bool = bool(self.config.enabled)
         self.logger = bot.logger
         self.temporal_parser = TemporalParser()
         # Persistence for engagement log
         self.cache_path = cache_path or os.path.join('cache', getattr(bot, 'bot_id', 'default'), 'spike')
         self.engagement_log_path = os.path.join(self.cache_path, 'engagement_log.pkl')
+        self.repository = SpikeRepository(
+            Path(self.cache_path) / self.config.database_filename
+        )
+        self.action_prompt_formats = self._load_action_yaml("spike_action_prompt_formats.yaml")
+        self.action_system_prompts = self._load_action_yaml("spike_action_system_prompts.yaml")
+        for key in ("spike_action_selection", "spike_action_reflection"):
+            if key in getattr(bot, "prompt_formats", {}):
+                self.action_prompt_formats[key] = bot.prompt_formats[key]
+            if key in getattr(bot, "system_prompts", {}):
+                self.action_system_prompts[key] = bot.system_prompts[key]
         self._mut = threading.RLock()
         self.engagement_log: Dict[int, datetime] = self._load_engagement_log()
         self._saver = AtomicSaver(self.engagement_log_path, self._snapshot_engagement, debounce=1.0, logger=self.logger)
+
+    @staticmethod
+    def _load_action_yaml(filename: str) -> dict[str, str]:
+        path = Path(__file__).resolve().parent / "prompts" / filename
+        with path.open("r", encoding="utf-8") as handle:
+            return yaml.safe_load(handle) or {}
+
+    async def initialize(self) -> None:
+        """Replay durable reflection work left by an interrupted process."""
+        pending = await asyncio.to_thread(self.repository.pending)
+        for event in pending:
+            event.status = "failed"
+            event.executions.append(SpikeExecution(
+                sequence=len(event.executions), kind=event.action or "silence",
+                name="spike_interrupted", arguments={}, ok=False,
+                error="SEEKING episode was interrupted before its result was committed",
+            ))
+            event.action = event.action or "silence"
+            await asyncio.to_thread(self.repository.save, event)
+        await self._recover_reflections()
+        await self._sync_pending_reflections()
 
     def _load_engagement_log(self) -> Dict[int, datetime]:
         """Load engagement log from disk or return empty defaultdict."""
@@ -331,11 +361,11 @@ class SpikeProcessor:
         self.logger.debug(f"spike.score bm25={score:.3f} theme={theme_score:.3f} final={final:.3f}")
         return final
 
-    async def find_target(self, orphaned_memory: str) -> Optional[SpikeEvent]:
+    async def find_targets(self, orphaned_memory: str) -> List[Surface]:
         surfaces = self.get_recent_surfaces()
         if not surfaces:
             self.logger.info("spike.no_surfaces")
-            return None
+            return []
 
         # Batch prefetch all channels at max_expansion (one API call per channel)
         buffers = await self.prefetch_surfaces(surfaces)
@@ -373,24 +403,636 @@ class SpikeProcessor:
                 'threshold': self.config.match_threshold,
                 'final_n': n,
             })
+            return []
+        viable.sort(key=lambda surface: surface.score, reverse=True)
+        return viable
+
+    async def find_target(self, orphaned_memory: str) -> Optional[SpikeEvent]:
+        viable = await self.find_targets(orphaned_memory)
+        if not viable:
             return None
-        target = max(viable, key=lambda s: s.score)
+        target = viable[0]
         self.logger.info(f"spike.target channel={target.channel.id} score={target.score:.3f}")
         self.logger.log({
             'event': 'spike_target_found',
             'orphaned_memory': orphaned_memory[:300],
             'target_channel': target.channel.id,
             'target_score': round(target.score, 3),
-            'surfaces_evaluated': len(surfaces),
-            'scores': {str(s.channel.id): round(s.score, 3) for s in surfaces},
+            'surfaces_evaluated': len(viable),
+            'scores': {str(s.channel.id): round(s.score, 3) for s in viable},
             'viable_count': len(viable),
-            'final_n': n,
         })
         return SpikeEvent(
             orphaned_memory=orphaned_memory,
             target=target,
             surface_seed=target.compressed
         )
+
+    def _natural_now(self) -> str:
+        expression = self.temporal_parser.get_temporal_expression(datetime.now())
+        return " ".join(
+            value for value in (expression.base_expression, expression.time_context)
+            if value
+        )
+
+    def _temporalize(self, text: str) -> str:
+        timestamp_pattern = r'\((\d{2}):(\d{2})\s*\[(\d{2}/\d{2}/\d{2})\]\)'
+        return re.sub(
+            timestamp_pattern,
+            lambda match: "(" + self.temporal_parser.get_temporal_expression(
+                datetime.strptime(
+                    f"{match.group(1)}:{match.group(2)} {match.group(3)}",
+                    "%H:%M %d/%m/%y",
+                )
+            ).base_expression + ")",
+            text,
+        )
+
+    @staticmethod
+    def _tool_schema(model: type[BaseModel]) -> dict[str, Any]:
+        value = model.model_json_schema()
+        value.pop("title", None)
+        return value
+
+    @staticmethod
+    def _principal(user) -> Principal:
+        return Principal(
+            key=f"discord:{user.id}",
+            display_name=getattr(user, "display_name", None) or user.name,
+            is_bot=bool(getattr(user, "bot", False)),
+        )
+
+    async def _related_users(self, source_user_id: str, memory: str) -> Dict[str, Any]:
+        users: Dict[str, Any] = {}
+        bot_user = getattr(self.bot, "user", None)
+        if source_user_id and (bot_user is None or str(bot_user.id) != str(source_user_id)):
+            try:
+                user = await self.bot.fetch_user(int(source_user_id))
+                if user:
+                    users[str(user.id)] = user
+            except Exception:
+                pass
+
+        mentioned_names = {name.casefold() for name in re.findall(r"@([\w.\-]+)", memory)}
+        get_all_members = getattr(self.bot, "get_all_members", None)
+        if mentioned_names and get_all_members:
+            for member in get_all_members():
+                names = {
+                    str(getattr(member, "name", "")).casefold(),
+                    str(getattr(member, "display_name", "")).casefold(),
+                }
+                if mentioned_names & names and (bot_user is None or member.id != bot_user.id):
+                    users[str(member.id)] = member
+        return users
+
+    def _background_tool_bundle(self, related_users: Dict[str, Any]):
+        bot_user = getattr(self.bot, "user", None)
+        if not bot_user or not self.config.allow_agent_tools:
+            return None
+        agent = self._principal(bot_user)
+        known_targets: dict[str, Principal] = {}
+        for user in related_users.values():
+            principal = self._principal(user)
+            known_targets[str(user.id)] = principal
+            known_targets[principal.key] = principal
+            known_targets[principal.display_name.casefold()] = principal
+            known_targets[str(getattr(user, "name", "")).casefold()] = principal
+
+        bundles = []
+        todo_service = getattr(self.bot, "todo_service", None)
+        if todo_service is not None:
+            context = TodoRequestContext(
+                actor=agent, agent=agent, source="spike",
+                known_targets=known_targets,
+            )
+            bundles.append(build_todo_tool_bundle(todo_service, context))
+        bookshelf = getattr(self.bot, "bookshelf_service", None)
+        if bookshelf is not None:
+            reader_id = str(
+                getattr(self.bot, "reader_id", None)
+                or getattr(self.bot, "agent_name", None)
+                or "default"
+            )
+            bundles.append(build_bookshelf_tool_bundle(bookshelf, reader_id))
+        return merge_tool_bundles(*bundles)
+
+    async def process_orphan(
+        self,
+        orphaned_memory: str,
+        *,
+        source_user_id: str | None = None,
+        source_memory_id: int | None = None,
+    ) -> SpikeActionOutcome:
+        """Run one bounded SEEKING episode and durably reflect on its action."""
+        await self._sync_pending_reflections()
+        source_user_id = str(source_user_id or getattr(self.bot, "agent_id", "unknown"))
+        raw_timestamp = datetime.now().strftime("(%H:%M [%d/%m/%y])")
+        event = SpikeActionEvent(
+            source_user_id=source_user_id,
+            source_memory_id=source_memory_id,
+            source_memory_hash=hashlib.sha256(orphaned_memory.encode("utf-8")).hexdigest(),
+            source_memory=orphaned_memory,
+            raw_timestamp=raw_timestamp,
+        )
+        await asyncio.to_thread(self.repository.save, event)
+
+        try:
+            source_name = await self.bot.resolve_user(source_user_id)
+        except Exception:
+            source_name = f"User({source_user_id})"
+
+        prior_attempts = await asyncio.to_thread(
+            self.repository.completed_count,
+            event.source_user_id,
+            event.source_memory_hash,
+        )
+        if prior_attempts >= self.config.max_attempts_per_memory:
+            event.action = "silence"
+            event.status = "completed"
+            event.release_recommended = True
+            event.executions.append(SpikeExecution(
+                sequence=0,
+                kind="silence",
+                name="spike_energy_exhausted",
+                arguments={
+                    "reason": "completed SEEKING energy budget already spent",
+                    "prior_attempts": prior_attempts,
+                },
+                result={"silent": True, "release_source": True},
+                ok=True,
+            ))
+            await asyncio.to_thread(self.repository.save, event)
+            try:
+                await self._reflect_action_event(event, source_name)
+            except Exception as exc:
+                self.logger.error(f"spike.action.reflect.err event={event.id} msg={exc}")
+            refreshed = await asyncio.to_thread(self.repository.get, event.id) or event
+            self.logger.log({
+                "event": "spike_energy_exhausted",
+                "event_id": refreshed.id,
+                "source_memory_hash": refreshed.source_memory_hash,
+                "prior_attempts": prior_attempts,
+            })
+            return SpikeActionOutcome(
+                event_id=refreshed.id,
+                action="silence",
+                status="completed",
+                grounded=False,
+                release_recommended=True,
+                reflection_memory=refreshed.memory_text,
+            )
+
+        surfaces = (
+            await self.find_targets(orphaned_memory)
+            if self.config.allow_channel_outreach else []
+        )
+        surface_by_id = {str(surface.channel.id): surface for surface in surfaces}
+        related_users = await self._related_users(source_user_id, orphaned_memory)
+        user_by_id = {
+            user_id: user for user_id, user in related_users.items()
+            if getattr(user, "id", None) != getattr(getattr(self.bot, "user", None), "id", None)
+            and not bool(getattr(user, "bot", False))
+        }
+
+        surface_lines = []
+        for surface in surfaces:
+            channel = surface.channel
+            if isinstance(channel, discord.TextChannel):
+                label = f"#{channel.name} in {channel.guild.name}"
+            else:
+                label = "DM"
+            surface_lines.append(
+                f"- channel_id={channel.id}; location={label}; resonance={surface.score:.3f}\n"
+                f"  {truncate_middle(surface.compressed, max_tokens=240)}"
+            )
+        related_lines = [
+            f"- user_id={user_id}; name=@{getattr(user, 'name', user_id)}"
+            for user_id, user in user_by_id.items()
+        ]
+
+        state_lock = threading.RLock()
+        origin_loop = asyncio.get_running_loop()
+
+        def reserve(kind: str, name: str, arguments: dict) -> SpikeExecution:
+            with state_lock:
+                if len(event.executions) >= self.config.max_tool_actions:
+                    raise RuntimeError("SEEKING action budget exhausted")
+                if kind in {"reach_channel", "message_user"} and any(
+                    item.kind in {"reach_channel", "message_user"}
+                    for item in event.executions
+                ):
+                    raise RuntimeError("only one outward message is allowed per SEEKING episode")
+                execution = SpikeExecution(
+                    sequence=len(event.executions), kind=kind, name=name,
+                    arguments=dict(arguments), ok=False, error="pending",
+                )
+                event.executions.append(execution)
+                event.action = kind
+                self.repository.save(event)
+                return execution
+
+        def finish(execution: SpikeExecution, *, result: Any = None, error: Exception | None = None):
+            with state_lock:
+                execution.result = result
+                execution.ok = error is None
+                execution.error = str(error) if error else None
+                self.repository.save(event)
+
+        async def on_gateway(coroutine):
+            if asyncio.get_running_loop() is origin_loop:
+                return await coroutine
+            future = asyncio.run_coroutine_threadsafe(coroutine, origin_loop)
+            return await asyncio.wrap_future(future)
+
+        action_specs: list[ToolSpec] = []
+        action_runtime: dict[str, Any] = {}
+
+        if surface_by_id:
+            async def reach_channel(arguments: dict):
+                channel_id = str(arguments.get("channel_id", ""))
+                content = str(arguments.get("content", "")).strip()
+                execution = reserve("reach_channel", "spike_reach_channel", arguments)
+                try:
+                    if channel_id not in surface_by_id:
+                        raise ValueError("channel_id must be an eligible recent surface")
+                    if not content:
+                        raise ValueError("content cannot be empty")
+                    now = datetime.now()
+                    if (now - self.last_spike).total_seconds() < self.config.cooldown_seconds:
+                        raise RuntimeError("outward-message cooldown is active")
+                    surface = surface_by_id[channel_id]
+                    channel = surface.channel
+                    formatted = format_discord_mentions(
+                        content, getattr(channel, "guild", None),
+                        self.bot.mentions_enabled, self.bot,
+                    )
+                    await on_gateway(self._send_chunked(channel, formatted))
+                    self.last_spike = now
+                    self.log_engagement(channel.id)
+                    result = {
+                        "sent": True, "channel_id": channel_id,
+                        "location": getattr(channel, "name", "DM"),
+                        "resonance": surface.score, "content": content,
+                    }
+                    finish(execution, result=result)
+                    return result
+                except Exception as exc:
+                    finish(execution, error=exc)
+                    raise
+
+            action_specs.append(ToolSpec(
+                name="spike_reach_channel",
+                description="Send one relevant message to an eligible recent channel.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "string", "enum": sorted(surface_by_id)},
+                        "content": {"type": "string", "minLength": 1, "maxLength": 1800},
+                    },
+                    "required": ["channel_id", "content"],
+                    "additionalProperties": False,
+                },
+            ))
+            action_runtime["spike_reach_channel"] = reach_channel
+
+        if user_by_id and self.config.allow_direct_messages:
+            async def message_user(arguments: dict):
+                user_id = str(arguments.get("user_id", ""))
+                content = str(arguments.get("content", "")).strip()
+                execution = reserve("message_user", "spike_message_user", arguments)
+                try:
+                    if user_id not in user_by_id:
+                        raise ValueError("user_id must be an eligible related user")
+                    if not content:
+                        raise ValueError("content cannot be empty")
+                    now = datetime.now()
+                    if (now - self.last_spike).total_seconds() < self.config.cooldown_seconds:
+                        raise RuntimeError("outward-message cooldown is active")
+                    user = user_by_id[user_id]
+                    sent_message = await on_gateway(user.send(content))
+                    self.last_spike = now
+                    sent_channel = getattr(sent_message, "channel", None)
+                    if sent_channel is not None:
+                        self.log_engagement(sent_channel.id)
+                    result = {
+                        "sent": True, "user_id": user_id,
+                        "user_name": getattr(user, "name", user_id), "content": content,
+                    }
+                    finish(execution, result=result)
+                    return result
+                except Exception as exc:
+                    finish(execution, error=exc)
+                    raise
+
+            action_specs.append(ToolSpec(
+                name="spike_message_user",
+                description="Send one direct message to an eligible user related to the unresolved association.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string", "enum": sorted(user_by_id)},
+                        "content": {"type": "string", "minLength": 1, "maxLength": 1800},
+                    },
+                    "required": ["user_id", "content"],
+                    "additionalProperties": False,
+                },
+            ))
+            action_runtime["spike_message_user"] = message_user
+
+        if self.config.allow_memory_search:
+            searchable_ids = sorted({source_user_id, *user_by_id.keys()})
+
+            async def search_memories(arguments: dict):
+                data = SpikeSearchInput.model_validate(arguments)
+                execution = reserve(
+                    "search_user_memories", "spike_search_user_memories", arguments
+                )
+                try:
+                    if data.user_id not in searchable_ids:
+                        raise ValueError("user_id must be related to the unresolved association")
+                    results = await self.memory_index.search_async(
+                        data.query, k=self.config.memory_k, user_id=data.user_id
+                    )
+                    filtered = [
+                        (memory, score) for memory, score in results
+                        if memory != orphaned_memory
+                    ]
+                    result = {
+                        "user_id": data.user_id, "query": data.query,
+                        "count": len(filtered),
+                        "memories": [
+                            {
+                                "relevance": round(float(score), 3),
+                                "memory": truncate_middle(
+                                    self._temporalize(memory),
+                                    max_tokens=self.config.memory_truncation,
+                                ),
+                            }
+                            for memory, score in filtered
+                        ],
+                    }
+                    event.query = data.query
+                    finish(execution, result=result)
+                    return result
+                except Exception as exc:
+                    finish(execution, error=exc)
+                    raise
+
+            search_schema = self._tool_schema(SpikeSearchInput)
+            search_schema["properties"]["user_id"]["enum"] = searchable_ids
+            action_specs.append(ToolSpec(
+                name="spike_search_user_memories",
+                description="Search a related user's memories with a new query you generate, excluding the unresolved source itself.",
+                parameters=search_schema,
+            ))
+            action_runtime["spike_search_user_memories"] = search_memories
+
+        async def choose_silence(arguments: dict):
+            data = SpikeSilenceInput.model_validate(arguments)
+            execution = reserve("silence", "spike_choose_silence", arguments)
+            result = {"silent": True, "reason": data.reason}
+            finish(execution, result=result)
+            return result
+
+        action_specs.append(ToolSpec(
+            name="spike_choose_silence",
+            description="Conclude that this unresolved association does not warrant action now.",
+            parameters=self._tool_schema(SpikeSilenceInput),
+        ))
+        action_runtime["spike_choose_silence"] = choose_silence
+
+        domain_bundle = self._background_tool_bundle(related_users)
+        if domain_bundle:
+            wrapped_runtime = {}
+            for name, implementation in domain_bundle.runtime.items():
+                async def invoke(arguments: dict, *, _name=name, _implementation=implementation):
+                    execution = reserve("invoke_tool", _name, arguments)
+                    try:
+                        result = await _implementation(arguments)
+                        finish(execution, result=result)
+                        return result
+                    except Exception as exc:
+                        finish(execution, error=exc)
+                        raise
+                wrapped_runtime[name] = invoke
+            domain_bundle = AgentToolBundle(
+                specs=domain_bundle.specs, runtime=wrapped_runtime
+            )
+
+        bundle = merge_tool_bundles(
+            AgentToolBundle(specs=action_specs, runtime=action_runtime),
+            domain_bundle,
+        )
+        surface_context = "\n\n".join(surface_lines) or "No recent channel met the outreach threshold."
+        related_context = "\n".join(related_lines) or "No directly messageable related user was resolved."
+        themes = format_themes_for_prompt(self.memory_index, source_user_id, mode="sections")
+        selection_prompt = self.action_prompt_formats["spike_action_selection"].format(
+            source_user=source_name,
+            memory=self._temporalize(orphaned_memory),
+            surface_context=surface_context,
+            related_users=related_context,
+            timestamp=self._natural_now(),
+        )
+        selection_system = self.action_system_prompts["spike_action_selection"].format(
+            agent_name=getattr(self.bot, "agent_name", getattr(self.bot.user, "name", "agent")),
+            amygdala_response=self.bot.amygdala_response,
+            themes=themes,
+        )
+
+        try:
+            response = await self.bot.call_api(
+                user_content=selection_prompt,
+                system_prompt=selection_system,
+                temperature=self.config.decision_temperature,
+                tools=bundle.specs,
+                tool_runtime=bundle.runtime,
+                auto_execute_tools=True,
+            )
+            _, traces = separate_thinking_traces(response)
+            await store_thinking_traces(
+                self.memory_index, str(self.bot.user.id), self.bot.user.name, traces
+            )
+        except Exception as exc:
+            successful = [execution for execution in event.executions if execution.ok]
+            event.status = "completed" if successful else "failed"
+            if event.executions:
+                event.action = event.executions[-1].kind
+            else:
+                event.action = "silence"
+                event.executions.append(SpikeExecution(
+                    sequence=0, kind="silence", name="spike_api_failure",
+                    arguments={}, ok=False, error=str(exc),
+                ))
+            event.grounded = any(
+                execution.kind in {"reach_channel", "message_user", "invoke_tool"}
+                or (
+                    execution.kind == "search_user_memories"
+                    and isinstance(execution.result, dict)
+                    and int(execution.result.get("count", 0)) > 0
+                )
+                for execution in successful
+            )
+            event.release_recommended = bool(
+                event.status == "completed" and not event.grounded
+                and any(
+                    (execution.kind == "silence" and self.config.release_on_silence)
+                    or (
+                        execution.kind == "search_user_memories"
+                        and isinstance(execution.result, dict)
+                        and int(execution.result.get("count", 0)) == 0
+                    )
+                    for execution in successful
+                )
+            )
+            await asyncio.to_thread(self.repository.save, event)
+        else:
+            successful = [execution for execution in event.executions if execution.ok]
+            if not event.executions:
+                event.executions.append(SpikeExecution(
+                    sequence=0, kind="silence", name="spike_implicit_silence",
+                    arguments={"reason": clean_response(response) or "no action selected"},
+                    result={"silent": True}, ok=True,
+                ))
+                event.action = "silence"
+                successful = list(event.executions)
+            priority = {
+                "reach_channel": 5, "message_user": 4,
+                "invoke_tool": 3, "search_user_memories": 2, "silence": 1,
+            }
+            event.action = max(
+                (execution.kind for execution in (successful or event.executions)),
+                key=lambda kind: priority[kind],
+            )
+            event.status = "completed" if successful else "failed"
+            event.grounded = any(
+                execution.ok and (
+                    execution.kind in {"reach_channel", "message_user", "invoke_tool"}
+                    or (
+                        execution.kind == "search_user_memories"
+                        and isinstance(execution.result, dict)
+                        and int(execution.result.get("count", 0)) > 0
+                    )
+                )
+                for execution in event.executions
+            )
+            weak_search = any(
+                execution.ok
+                and execution.kind == "search_user_memories"
+                and isinstance(execution.result, dict)
+                and int(execution.result.get("count", 0)) == 0
+                for execution in successful
+            )
+            event.release_recommended = bool(
+                event.status == "completed" and not event.grounded
+                and (
+                    weak_search
+                    or (
+                        self.config.release_on_silence
+                        and any(execution.kind == "silence" for execution in successful)
+                    )
+                )
+            )
+            for execution in reversed(event.executions):
+                if execution.ok and execution.kind in {"reach_channel", "message_user"}:
+                    result = execution.result if isinstance(execution.result, dict) else {}
+                    event.target_id = str(result.get("channel_id") or result.get("user_id") or "") or None
+                    event.target_label = str(result.get("location") or result.get("user_name") or "") or None
+                    break
+            await asyncio.to_thread(self.repository.save, event)
+
+        try:
+            await self._reflect_action_event(event, source_name)
+        except Exception as exc:
+            self.logger.error(f"spike.action.reflect.err event={event.id} msg={exc}")
+
+        refreshed = await asyncio.to_thread(self.repository.get, event.id) or event
+        self.logger.log({
+            "event": "spike_action_completed",
+            "event_id": refreshed.id,
+            "action": refreshed.action,
+            "status": refreshed.status,
+            "grounded": refreshed.grounded,
+            "release_recommended": refreshed.release_recommended,
+            "executions": [item.model_dump(mode="json") for item in refreshed.executions],
+        })
+        return SpikeActionOutcome(
+            event_id=refreshed.id,
+            action=refreshed.action or "silence",
+            status=refreshed.status,
+            grounded=refreshed.grounded,
+            release_recommended=refreshed.release_recommended,
+            reflection_memory=refreshed.memory_text,
+        )
+
+    async def _reflect_action_event(self, event: SpikeActionEvent, source_name: str | None = None) -> None:
+        source_name = source_name or await self.bot.resolve_user(event.source_user_id)
+        action_context = json.dumps(
+            [execution.model_dump(mode="json") for execution in event.executions],
+            ensure_ascii=False, indent=2,
+        )
+        result_context = "completed" if event.status == "completed" else "failed"
+        grounding_context = (
+            "independent evidence was found; a successor reflection may re-enter the graph"
+            if event.grounded else
+            "no independent grounding was established; this reflection must not rescue the source by itself"
+        )
+        themes = format_themes_for_prompt(
+            self.memory_index, event.source_user_id, mode="sections"
+        )
+        prompt = self.action_prompt_formats["spike_action_reflection"].format(
+            memory=self._temporalize(event.source_memory),
+            action_context=truncate_middle(action_context, max_tokens=1600),
+            result_context=result_context,
+            grounding_context=grounding_context,
+            timestamp=self._natural_now(),
+        )
+        system = self.action_system_prompts["spike_action_reflection"].format(
+            agent_name=getattr(self.bot, "agent_name", getattr(self.bot.user, "name", "agent")),
+            amygdala_response=self.bot.amygdala_response,
+            themes=themes,
+        )
+        response = await self.bot.call_api(
+            user_content=prompt, system_prompt=system,
+            temperature=self.bot.amygdala_response / 100,
+        )
+        reflection, traces = separate_thinking_traces(response)
+        await store_thinking_traces(
+            self.memory_index, str(self.bot.user.id), self.bot.user.name, traces
+        )
+        reflection = clean_response(reflection).strip()
+        if not reflection:
+            raise ValueError("spike action reflection was empty")
+        event.reflection = reflection
+        event.memory_text = (
+            f"Reflections on SEEKING {event.action} for @{source_name} "
+            f"{event.raw_timestamp}:\n{reflection}"
+        )
+        await asyncio.to_thread(self.repository.save, event)
+        await self._sync_action_reflection(event)
+
+    async def _sync_action_reflection(self, event: SpikeActionEvent) -> None:
+        if not event.memory_text:
+            return
+        with self.memory_index._mut:
+            already_present = event.memory_text in self.memory_index.memories
+        if not already_present:
+            await self.memory_index.add_memory_async(
+                str(self.bot.user.id), event.memory_text
+            )
+        await asyncio.to_thread(self.repository.mark_synced, event.id)
+
+    async def _sync_pending_reflections(self) -> None:
+        events = await asyncio.to_thread(self.repository.unsynced)
+        for event in events:
+            await self._sync_action_reflection(event)
+
+    async def _recover_reflections(self) -> None:
+        events = await asyncio.to_thread(self.repository.awaiting_reflection)
+        for event in events:
+            try:
+                await self._reflect_action_event(event)
+            except Exception as exc:
+                self.logger.error(f"spike.action.recover.err event={event.id} msg={exc}")
 
     async def process_spike(self, event: SpikeEvent) -> Optional[str]:
         now = datetime.now()
@@ -676,12 +1318,18 @@ class SpikeProcessor:
             await asyncio.sleep(0.1)
 
 
-async def handle_orphaned_memory(spike_processor: SpikeProcessor, orphaned_memory: str) -> bool:
+async def handle_orphaned_memory(
+    spike_processor: SpikeProcessor,
+    orphaned_memory: str,
+    *,
+    source_user_id: str | None = None,
+    source_memory_id: int | None = None,
+) -> SpikeActionOutcome | None:
     if not spike_processor.enabled:
         spike_processor.logger.info("spike.disabled skipping orphan handling")
-        return False
-    event = await spike_processor.find_target(orphaned_memory)
-    if not event:
-        return False
-    response = await spike_processor.process_spike(event)
-    return response is not None
+        return None
+    return await spike_processor.process_orphan(
+        orphaned_memory,
+        source_user_id=source_user_id,
+        source_memory_id=source_memory_id,
+    )

@@ -244,25 +244,53 @@ class DMNProcessor:
             # No related memories - this is an orphan, delegate to spike immediately
             # If this seed came from pending_seeds it already had its spike chance — bail cleanly
             if from_pending:
-                self.logger.info("dmn.pending_seed still orphaned after spike—dropping")
+                self.logger.info("dmn.pending_seed still orphaned after SEEKING—dissolving successor")
+                self._disconnect_memory(seed_mid, seed_memory)
                 self._cleanup_disconnected_memories()
                 return
             self.logger.info(f"dmn.orphan detected—delegating to spike")
             if self.runtime.spike_processor:
                 from spike import handle_orphaned_memory
-                fired = await handle_orphaned_memory(self.runtime.spike_processor, seed_memory)
-                if fired:
-                    # Queue under bot's own user_id so the next search finds the spike
-                    # interaction memory (stored under bot.user.id, not the original user)
-                    bot_uid = self.runtime.agent_id
-                    self.logger.info(f"spike.fired from dmn orphan—queuing under bot_uid={bot_uid} for dmn reprocessing")
-                    entry = (bot_uid, seed_mid, seed_memory)
-                    if entry not in self.pending_seeds:
-                        self.pending_seeds.append(entry)
+                outcome = await handle_orphaned_memory(
+                    self.runtime.spike_processor,
+                    seed_memory,
+                    source_user_id=user_id,
+                    source_memory_id=seed_mid,
+                )
+                if outcome and (outcome.grounded or outcome.release_recommended):
+                    # SEEKING is the source trace's final energy budget. A grounded
+                    # action produces a reconsolidated successor; an ungrounded
+                    # terminal action permits the old trace to dissolve.
+                    self._disconnect_memory(seed_mid, seed_memory)
                     self._cleanup_disconnected_memories()
+                if outcome and outcome.grounded and outcome.reflection_memory:
+                    bot_uid = self.runtime.agent_id
+                    successor_mid = None
+                    with self.memory_index._mut:
+                        for candidate_mid in reversed(self.memory_index.user_memories.get(bot_uid, [])):
+                            if (candidate_mid < len(self.memory_index.memories)
+                                    and self.memory_index.memories[candidate_mid] == outcome.reflection_memory):
+                                successor_mid = candidate_mid
+                                break
+                    if successor_mid is not None:
+                        entry = (bot_uid, successor_mid, outcome.reflection_memory)
+                        if entry not in self.pending_seeds:
+                            self.pending_seeds.append(entry)
+                        self.logger.info(
+                            f"spike.grounded—queued successor under bot_uid={bot_uid} "
+                            f"mid={successor_mid}"
+                        )
                     return
-                else:
-                    self.logger.info("spike.declined (no viable surface or cooldown)—retrying seed")
+                if outcome and outcome.release_recommended:
+                    self.logger.info(
+                        f"spike.ungrounded action={outcome.action}—source dissolved"
+                    )
+                    return
+                if outcome:
+                    self.logger.info("spike.incomplete—retaining unresolved seed for a later cycle")
+                    # Infrastructure/tool failure does not spend the source's
+                    # remaining energy, but it does end this bounded DMN tick.
+                    return
             # If spike didn't fire, continue retry loop for a new seed
             self.logger.info(f"Attempt {attempt + 1}: No related memories found, trying another seed memory")
             if attempt == max_retries - 1:
@@ -599,6 +627,32 @@ class DMNProcessor:
         self.memory_index._saver.request()
         self.logger.info(f"dmn.cleanup removed={len(disc)}")
         self.logger.log({'event':'dmn_memory_cleanup','timestamp':datetime.now().isoformat(),'removed':len(disc),'owners':{str(k):v for k,v in owners.items()},'disconnected_memories':texts})
+
+    def _disconnect_memory(self, memory_id: int | None, memory_text: str) -> bool:
+        """Spend an unresolved trace's remaining index energy before cleanup."""
+        if memory_id is None:
+            return False
+        with self.memory_index._mut:
+            if (memory_id >= len(self.memory_index.memories)
+                    or self.memory_index.memories[memory_id] != memory_text):
+                self.logger.info(
+                    f"dmn.disconnect skipped: mid={memory_id} stale or missing"
+                )
+                return False
+            removed = 0
+            for term in list(self.memory_index.inverted_index):
+                postings = self.memory_index.inverted_index[term]
+                if memory_id not in postings:
+                    continue
+                filtered = [mid for mid in postings if mid != memory_id]
+                removed += len(postings) - len(filtered)
+                if filtered:
+                    self.memory_index.inverted_index[term] = filtered
+                else:
+                    del self.memory_index.inverted_index[term]
+        self.memory_index._saver.request()
+        self.logger.info(f"dmn.disconnect mid={memory_id} postings_removed={removed}")
+        return True
 
 
     def set_mode(self, mode):

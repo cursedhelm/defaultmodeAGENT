@@ -84,7 +84,7 @@ class PersonaConfig(BaseModel):
 class SystemConfig(BaseModel):
     """System-wide configuration"""
     poll_interval: int = Field(default=int(os.getenv('POLL_INTERVAL', 120)))
-    tick_rate: int = Field(default=800)
+    tick_rate: int = Field(default=int(os.getenv('GLOBAL_TICK_RATE', '800')), ge=1)
 
 class AttentionConfig(BaseModel):
     """Attention mechanism configuration"""
@@ -187,17 +187,27 @@ class DMNConfig(BaseModel):
 
 class SpikeConfig(BaseModel):
     """Spike processor configuration - handles orphaned memory outreach"""
-    context_n: int = Field(default=50, description="Initial message count to compress per surface")
-    max_expansion: int = Field(default=150, description="Maximum message count for tie-breaking expansion")
-    expansion_step: int = Field(default=25, description="Step size when expanding context for ties")
-    match_threshold: float = Field(default=0.35, description="Minimum score for surface to be viable")
-    compression_ratio: float = Field(default=0.6, description="Chronpression ratio for surface context")
-    cooldown_seconds: int = Field(default=120, description="Minimum seconds between spike fires")
-    max_surfaces: int = Field(default=8, description="Maximum recent surfaces to consider")
-    recency_window_hours: int = Field(default=512, description="Hours to look back for engaged surfaces")
-    memory_k: int = Field(default=12, description="Number of memories to retrieve for context")
-    memory_truncation: int = Field(default=512, description="Max tokens per memory in context")
-    theme_weight: float = Field(default=0.3, description="Weight for theme resonance in scoring (0-1)")
+    enabled: bool = Field(default=os.getenv('SPIKE_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    database_filename: str = Field(default=os.getenv('SPIKE_DATABASE', 'spike.sqlite3'), min_length=1)
+    context_n: int = Field(default=int(os.getenv('SPIKE_CONTEXT_MESSAGES', '50')), ge=1, description="Initial message count to compress per surface")
+    max_expansion: int = Field(default=int(os.getenv('SPIKE_MAX_EXPANSION', '150')), ge=1, description="Maximum message count for tie-breaking expansion")
+    expansion_step: int = Field(default=int(os.getenv('SPIKE_EXPANSION_STEP', '25')), ge=1, description="Step size when expanding context for ties")
+    match_threshold: float = Field(default=float(os.getenv('SPIKE_MATCH_THRESHOLD', '0.35')), ge=0, le=1, description="Minimum score for surface to be viable")
+    compression_ratio: float = Field(default=float(os.getenv('SPIKE_COMPRESSION_RATIO', '0.6')), ge=0, le=1, description="Chronpression ratio for surface context")
+    cooldown_seconds: int = Field(default=int(os.getenv('SPIKE_COOLDOWN_SECONDS', '120')), ge=0, description="Minimum seconds between outward messages")
+    max_surfaces: int = Field(default=int(os.getenv('SPIKE_MAX_SURFACES', '8')), ge=1, description="Maximum recent surfaces to consider")
+    recency_window_hours: int = Field(default=int(os.getenv('SPIKE_RECENCY_HOURS', '512')), ge=1, description="Hours to look back for engaged surfaces")
+    memory_k: int = Field(default=int(os.getenv('SPIKE_MEMORY_K', '12')), ge=1, description="Number of memories to retrieve for context")
+    memory_truncation: int = Field(default=int(os.getenv('SPIKE_MEMORY_TRUNCATION', '512')), ge=32, description="Max tokens per memory in context")
+    theme_weight: float = Field(default=float(os.getenv('SPIKE_THEME_WEIGHT', '0.3')), ge=0, le=1, description="Weight for theme resonance in scoring (0-1)")
+    max_tool_actions: int = Field(default=int(os.getenv('SPIKE_MAX_TOOL_ACTIONS', '3')), ge=1, le=8, description="Maximum local tool calls in one SEEKING episode")
+    max_attempts_per_memory: int = Field(default=int(os.getenv('SPIKE_MAX_ATTEMPTS_PER_MEMORY', '1')), ge=1, le=10, description="Maximum completed SEEKING episodes for one source memory")
+    decision_temperature: float = Field(default=float(os.getenv('SPIKE_DECISION_TEMPERATURE', '0.5')), ge=0, le=2)
+    allow_channel_outreach: bool = Field(default=os.getenv('SPIKE_ALLOW_CHANNELS', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    allow_direct_messages: bool = Field(default=os.getenv('SPIKE_ALLOW_DMS', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    allow_agent_tools: bool = Field(default=os.getenv('SPIKE_ALLOW_TOOLS', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    allow_memory_search: bool = Field(default=os.getenv('SPIKE_ALLOW_MEMORY_SEARCH', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    release_on_silence: bool = Field(default=os.getenv('SPIKE_RELEASE_ON_SILENCE', 'true').lower() in ('1', 'true', 'yes', 'on'))
 
 class EmbeddingConfig(BaseModel):
     """Pydantic model for embedding configuration."""
@@ -225,6 +235,43 @@ class TodoConfig(BaseModel):
     semantic_ambiguity_margin: float = Field(default=float(os.getenv('TODO_AMBIGUITY_MARGIN', '0.05')), ge=0.0, le=2.0)
     import_directory: str | None = Field(default=os.getenv('TODO_IMPORT_DIRECTORY') or None)
 
+
+class BookshelfConfig(BaseModel):
+    """Per-agent document store and hybrid chunk index configuration."""
+    enabled: bool = Field(default=os.getenv('BOOKSHELF_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    database_filename: str = Field(default=os.getenv('BOOKSHELF_DATABASE', 'bookshelf.sqlite3'), min_length=1)
+    max_file_bytes: int = Field(default=int(os.getenv('BOOKSHELF_MAX_FILE_BYTES', str(100 * 1024 * 1024))), ge=1024)
+    chunk_target_tokens: int = Field(default=int(os.getenv('BOOKSHELF_CHUNK_TOKENS', '1200')), ge=1024)
+    embedding_provider: Literal['openai', 'openrouter', 'ollama', 'llama-server', 'vllm', 'unsloth', 'gemini'] = Field(default=os.getenv('BOOKSHELF_EMBED_PROVIDER', 'ollama'))
+    embedding_model: str = Field(default=os.getenv('BOOKSHELF_EMBED_MODEL', 'all-minilm:latest'), min_length=1)
+    max_embed_tokens: int = Field(default=int(os.getenv('BOOKSHELF_MAX_EMBED_TOKENS', '1200')), ge=8)
+    embedding_batch_size: int = Field(default=int(os.getenv('BOOKSHELF_EMBED_BATCH_SIZE', '16')), ge=1, le=512)
+    ingestion_stale_seconds: int = Field(default=int(os.getenv('BOOKSHELF_INGESTION_STALE_SECONDS', '3600')), ge=60)
+    hybrid_blend: float = Field(default=float(os.getenv('BOOKSHELF_HYBRID_BLEND', '0.45')), ge=0.0, le=1.0)
+    candidate_pool: int = Field(default=int(os.getenv('BOOKSHELF_CANDIDATE_POOL', '64')), ge=1)
+    semantic_scan_limit: int = Field(default=int(os.getenv('BOOKSHELF_SEMANTIC_SCAN_LIMIT', '5000')), ge=1)
+    max_media_per_chunk: int = Field(default=int(os.getenv('BOOKSHELF_MAX_MEDIA_PER_CHUNK', '4')), ge=0, le=32)
+
+
+class ReadingConfig(BaseModel):
+    """Background READER loop, independently routable from chat and DMN."""
+    enabled: bool = Field(default=os.getenv('READER_ENABLED', 'true').lower() in ('1', 'true', 'yes', 'on'))
+    tick_rate: int | None = Field(
+        default=(int(os.environ['READER_TICK_RATE']) if os.getenv('READER_TICK_RATE') else None),
+        ge=1,
+        description="Optional READER-specific override; otherwise use system.tick_rate.",
+    )
+    reader_api_type: str | None = Field(default=os.getenv('READER_API_TYPE') or None)
+    reader_model: str | None = Field(default=os.getenv('READER_MODEL') or None)
+    temperature: float = Field(default=float(os.getenv('READER_TEMPERATURE', '0.7')), ge=0.0, le=2.0)
+    memory_candidates: int = Field(default=int(os.getenv('READER_MEMORY_CANDIDATES', '32')), ge=1)
+    memory_limit: int = Field(default=int(os.getenv('READER_MEMORY_LIMIT', '12')), ge=1)
+    prior_limit: int = Field(default=int(os.getenv('READER_PRIOR_LIMIT', '8')), ge=0)
+    memory_truncation: int = Field(default=int(os.getenv('READER_MEMORY_TRUNCATION', '256')), ge=16)
+    prompt_context_tokens: int = Field(default=int(os.getenv('READER_CONTEXT_TOKENS', '6000')), ge=256)
+    selection_limit: int = Field(default=int(os.getenv('READER_SELECTION_LIMIT', '5')), ge=1, le=25)
+    prior_scope: Literal['global', 'agent'] = Field(default=os.getenv('READER_PRIOR_SCOPE', 'global'))
+
 class DiscordConfig(BaseModel):
     """Discord-specific configuration"""
     channel_id: str = Field(default=os.getenv('DISCORD_CHANNEL_ID'))
@@ -233,10 +280,10 @@ class DiscordConfig(BaseModel):
     slash_guild_id: str = Field(default=os.getenv('DISCORD_SLASH_GUILD_ID'))
     global_slash_commands: bool = Field(default=os.getenv('DISCORD_GLOBAL_SLASH_COMMANDS', 'false').lower() in ('1', 'true', 'yes', 'on'))
     
-    system_commands: Set[str] = Field(default={ 'kill', 'resume', 'get_logs', 'dmn', 'mentions', 'persona', 'search_memories', 'spike' })
+    system_commands: Set[str] = Field(default={ 'kill', 'resume', 'get_logs', 'dmn', 'reader', 'mentions', 'persona', 'search_memories', 'spike' })
     management_commands: Set[str] = Field(default={ 'add_memory', 'index_repo', 'reranking', 'clear_memories', 'attention', 'spike' })
     general_commands: Set[str] = Field(default={ 'summarize', 'ask_repo', 'repo_file_chat', 'analyze_file' })
-    bot_action_commands: Set[str] = Field(default={ 'help', 'dmn', 'persona', 'add_memory', 'ask_repo', 'search_memories', 'kill', 'attention', 'todo', 'goal', 'todont' })
+    bot_action_commands: Set[str] = Field(default={ 'help', 'dmn', 'reader', 'persona', 'add_memory', 'ask_repo', 'search_memories', 'kill', 'attention', 'todo', 'goal', 'todont' })
 
     def has_command_permission(self, command_name: str, ctx) -> bool:
         if command_name not in (
@@ -332,6 +379,10 @@ class PromptSchema(BaseModel):
         "image_analysis": {"amygdala_response"},
         "combined_analysis": {"amygdala_response"},
         "spike_engagement": {"amygdala_response", "themes"},
+        "spike_action_selection": {"agent_name", "amygdala_response", "themes"},
+        "spike_action_reflection": {"agent_name", "amygdala_response", "themes"},
+        "bookshelf_selection": {"amygdala_response", "themes"},
+        "reading_reflection": {"amygdala_response", "themes"},
         "attention_triggers": set(),
     }
     required_formats: ClassVar[Dict[str, Set[str]]] = {
@@ -347,6 +398,10 @@ class PromptSchema(BaseModel):
         "analyze_file": {"assembled_context", "filename", "file_content", "user_message", "user_name"},
         "analyze_combined": {"assembled_context", "image_files", "text_files", "user_message", "user_name"},
         "spike_engagement": {"tension_desc", "memory", "memory_context", "conversation_context", "location", "timestamp"},
+        "spike_action_selection": {"source_user", "memory", "surface_context", "related_users", "timestamp"},
+        "spike_action_reflection": {"memory", "action_context", "result_context", "grounding_context", "timestamp"},
+        "bookshelf_choose_book": {"curiosity_seed", "candidate_books", "timestamp"},
+        "reading_reflection": {"book_metadata", "position", "section_text", "memory_context", "prior_reading_context", "timestamp"},
     }
 
 
@@ -364,6 +419,8 @@ class BotConfig(BaseModel):
     dmn: DMNConfig = Field(default_factory=DMNConfig)
     spike: SpikeConfig = Field(default_factory=SpikeConfig)
     todo: TodoConfig = Field(default_factory=TodoConfig)
+    bookshelf: BookshelfConfig = Field(default_factory=BookshelfConfig)
+    reading: ReadingConfig = Field(default_factory=ReadingConfig)
 
 # Create global config instance
 config = BotConfig()

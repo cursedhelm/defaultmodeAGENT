@@ -69,7 +69,7 @@ input → attention filter → hippocampal retrieval → reranking by embedding
 ## cognitive architecture
 
 - **default mode network** — background process performs associative memory walks, generates reflective thoughts, prunes term overlap between related memories, and manages graceful forgetting. the agent dreams between conversations.
-- **spike processor** — when DMN encounters an orphaned memory (pruned to isolation, no internal connections remaining), it delegates to spike. spike scans recently-engaged channels for semantic resonance using BM25 scoring blended with theme matching. a viable match triggers unprompted outreach. every fired spike produces two memories stored under the bot's own user ID: an interaction record and a private reflection — both feed back into future DMN walks, enabling meta-cognition about its own outreach behaviour. requires `spike_engagement` prompts in both yaml files.
+- **spike / SEEKING processor** — when DMN pruning leaves a selected memory unable to resolve an association above its BM25 threshold, the agent spends one bounded action sourcing meaning: reach a recent channel, DM a related user, use authorized todo/bookshelf tools, search related memories with a generated query, or choose silence. every action is durably reflected under the bot's ID; grounded reflections re-enter DMN as reconsolidated successors, while ungrounded sources dissolve.
 - **amygdala complex** — memory density modulates arousal which scales llm temperature dynamically. sparse context → careful, deterministic. rich context → creative, exploratory. emotional tone emerges from cognitive state.
 - **hippocampal formation** — hybrid retrieval blending inverted index with tf-idf scoring and embedding-based reranking at inference time. bandwidth adapts to arousal level for human-like recall under pressure.
 - **temporal integration** — timestamps parsed as natural language expressions ("yesterday morning", "last week") rather than raw datetime, giving the agent intuitive temporal reasoning about its memories.
@@ -91,6 +91,7 @@ input → attention filter → hippocampal retrieval → reranking by embedding
 - **web and youtube grokking** — shared links scraped and processed using holistic "skim" reading rather than narrow chunking. content understood in context, not fragments.
 - **file and image processing** — attachments analyzed with vision models when available. text files, code, images all flow into memory and context.
 - **github integration** — repository indexing, file-specific chat, and rag-style repo questions. code becomes part of the agent's extended mind.
+- **bookshelf + reader** — each agent owns a cached PDF/EPUB library, hybrid chunk index, restart-safe reading position, and an independently configured background READER that reflects into long-term memory.
 
 ## discord-native design
 

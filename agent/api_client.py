@@ -32,7 +32,7 @@ from api_schema import (
 
 # ───────────────────────────  constants & init  ────────────────────────────
 MAX_IMAGE_DIM = 640
-CONSOLE_PREVIEW_CHARS = 4000
+CONSOLE_PREVIEW_CHARS = 256000
 API_LOG_QUEUE_SIZE = 2048
 API_LOG_BATCH_SIZE = 64
 API_LOG_FLUSH_INTERVAL = 0.5
@@ -54,6 +54,7 @@ class APIState(BaseModel):
     api_base:   str | None = None
     api_key:    str | None = None
     model_name: str | None = None
+    api_log_path: str = "api_calls.jsonl"
     temperature: float = Field(0.7, ge=0.0, le=2.0)
     top_p:       float = Field(0.9, gt=0.0, le=1.0)
     frequency_penalty: float = Field(0.8, ge=-2.0, le=2.0)
@@ -516,9 +517,9 @@ def shutdown_api_logger(timeout: float = 5.0) -> None:
         _api_log_writer.shutdown(timeout=timeout)
 
 
-def log_to_jsonl(data: dict, path: str = "api_calls.jsonl") -> None:
+def log_to_jsonl(data: dict, path: str | None = None) -> None:
     """Queue an API log record; JSON serialization and file I/O stay off-thread."""
-    _get_api_log_writer().submit(data, path)
+    _get_api_log_writer().submit(data, path or api.api_log_path)
 
 def get_api_config(api_type: str, model_override: str | None = None) -> ProviderConfig:
     if api_type == "ollama":
@@ -580,6 +581,10 @@ def initialize_api_client(args):
     api.model_name = cfg.model_name
     api.api_base   = cfg.api_base
     api.api_key    = cfg.api_key
+    api.api_log_path = os.fspath(
+        getattr(args, "api_log_path", None)
+        or os.getenv("API_LOG_PATH", "api_calls.jsonl")
+    )
     _load_stateful_provider_defaults(api.api_type)
     if api.api_type == "openai": openai.api_key = api.api_key
     logging.info("Initialized API client (%s, model=%s)", api.api_type, api.model_name)

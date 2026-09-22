@@ -46,6 +46,7 @@ try:
     import anydoc
     ANYDOC_AVAILABLE = True
 except ImportError:
+    anydoc = None
     ANYDOC_AVAILABLE = False
     logging.info(
         "anydoc not installed - document ingestion unavailable. "

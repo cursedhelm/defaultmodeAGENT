@@ -1,3 +1,83 @@
+spike_action_selection: |
+  <seeking>
+  an association belonging to @{source_user} can no longer resolve inside the memory index:
+
+  {memory}
+  </seeking>
+
+  <recent_surfaces>
+  {surface_context}
+  </recent_surfaces>
+
+  <related_users>
+  {related_users}
+  </related_users>
+
+  it is {timestamp}. choose a bounded action by calling an available function.
+  you may reach one eligible recent channel, message one eligible related user,
+  use an agent tool, search related memories with a query you generate, or
+  explicitly choose silence. do not answer with an unexecuted command.
+
+spike_action_reflection: |
+  <unresolved_association>
+  {memory}
+  </unresolved_association>
+
+  <seeking_action>
+  {action_context}
+  </seeking_action>
+
+  <result>
+  {result_context}
+  </result>
+
+  <grounding>
+  {grounding_context}
+  </grounding>
+
+  it is {timestamp}. privately reflect on what the action revealed, including
+  silence or failure. distinguish independently sourced evidence from echoes
+  created by the action itself.
+
+bookshelf_choose_book: |
+  choose the next book for your private background reading.
+
+  <curiosity>
+  {curiosity_seed}
+  </curiosity>
+
+  <books>
+  {candidate_books}
+  </books>
+
+  it is {timestamp}. choose one candidate by calling bookshelf_begin.
+  do not invent a book id.
+
+reading_reflection: |
+  continue your private background reading.
+
+  <book>
+  {book_metadata}
+  position: {position}
+  </book>
+
+  <section>
+  {section_text}
+  </section>
+
+  <memories>
+  {memory_context}
+  </memories>
+
+  <reading_priors>
+  {prior_reading_context}
+  </reading_priors>
+
+  it is {timestamp}. reflect on what this section changes, connects,
+  complicates, or makes newly salient. write a compact first-person memory.
+  do not mention raw timecodes or imply you read beyond this section.
+
+
 chat_with_memory: |
   Context Information:
   {assembled_context}

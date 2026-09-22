@@ -16,7 +16,7 @@ from tui.shared import (
 )
 
 LOG_READ_BYTES = 4096
-LOG_LINE_LIMIT = 8000
+LOG_LINE_LIMIT = 256000
 
 
 def _trim_log_line(text: str, limit: int = LOG_LINE_LIMIT) -> str:
@@ -88,6 +88,13 @@ class LaunchPage(Vertical):
                         Input(placeholder="or type dmn model", id="dmn-model-input"),
                         classes="launch-col",
                     ),
+                    Vertical(
+                        Label("[bold]READER[/bold] [dim](optional)[/dim]"),
+                        ListView(id="reader-api-list"),
+                        ListView(id="reader-model-list"),
+                        Input(placeholder="or type reader model", id="reader-model-input"),
+                        classes="launch-col",
+                    ),
                     id="launch-selectors",
                 ),
                 Label("", id="config-summary"),
@@ -111,6 +118,7 @@ class LaunchPage(Vertical):
         self._populate_bots()
         self._populate_apis()
         self._populate_dmn_apis()
+        self._populate_reader_apis()
         self.query_one("#dmn-model-list", ListView).append(
             SelectableItem("chronpression", "chronpression", "no LLM required", True)
         )
@@ -138,6 +146,13 @@ class LaunchPage(Vertical):
             avail = check_api_available(api)
             lv.append(SelectableItem(api.upper(), api, "", avail))
 
+    def _populate_reader_apis(self):
+        lv = self.query_one("#reader-api-list", ListView)
+        lv.clear()
+        lv.append(SelectableItem("(same)", "", "use main api", True))
+        for api in SUPPORTED_APIS:
+            lv.append(SelectableItem(api.upper(), api, "", check_api_available(api)))
+
     @work(thread=True)
     def _fetch_models(self, api: str) -> list[str]:
         buf = io.StringIO()
@@ -158,8 +173,9 @@ class LaunchPage(Vertical):
         models = await self._fetch_models(api).wait()
         lv.loading = False
         d = get_default_model(api)
-        if target == "#dmn-model-list":
+        if target in {"#dmn-model-list", "#reader-model-list"}:
             lv.append(SelectableItem("(same)", "", "use main model", True))
+        if target == "#dmn-model-list":
             lv.append(SelectableItem("chronpression", "chronpression", "no LLM required", True))
         for m in models or ([d] if d else []):
             lv.append(SelectableItem(m, m, "(default)" if m == d else "", True))
@@ -225,6 +241,31 @@ class LaunchPage(Vertical):
         STATE.dmn_model = v if v else None
         self._update_summary()
 
+    @on(ListView.Selected, "#reader-api-list")
+    async def on_reader_api_selected(self, event: ListView.Selected):
+        if isinstance(event.item, SelectableItem):
+            value = event.item.value
+            STATE.reader_api = value or None
+            if value:
+                await self._populate_models(value, "#reader-model-list")
+            else:
+                STATE.reader_model = None
+                self.query_one("#reader-model-list", ListView).clear()
+            self._update_summary()
+
+    @on(ListView.Selected, "#reader-model-list")
+    def on_reader_model_selected(self, event: ListView.Selected):
+        if isinstance(event.item, SelectableItem):
+            STATE.reader_model = event.item.value or None
+            if event.item.value:
+                self.query_one("#reader-model-input", Input).value = event.item.value
+            self._update_summary()
+
+    @on(Input.Changed, "#reader-model-input")
+    def on_reader_model_input(self, event: Input.Changed):
+        STATE.reader_model = event.value.strip() or None
+        self._update_summary()
+
     def _update_summary(self):
         parts = []
         if STATE.selected_bot:
@@ -240,6 +281,9 @@ class LaunchPage(Vertical):
             if STATE.dmn_model:
                 dmn_parts.append(STATE.dmn_model)
             parts.append(f"DMN:{'/'.join(dmn_parts)}")
+        if STATE.reader_api or STATE.reader_model:
+            reader_parts = [value for value in (STATE.reader_api, STATE.reader_model) if value]
+            parts.append(f"READER:{'/'.join(reader_parts)}")
         self.query_one("#config-summary", Label).update(" / ".join(parts))
 
     @on(Button.Pressed, "#launch-btn")
@@ -254,6 +298,8 @@ class LaunchPage(Vertical):
             model=STATE.selected_model or get_default_model(STATE.selected_api),
             dmn_api=STATE.dmn_api,
             dmn_model=STATE.dmn_model,
+            reader_api=STATE.reader_api,
+            reader_model=STATE.reader_model,
         )
         STATE.instances[instance.bot_name] = instance
         await self._add_instance_card(instance)
@@ -278,6 +324,10 @@ class LaunchPage(Vertical):
                 cmd.extend(["--dmn-api", instance.dmn_api])
             if instance.dmn_model:
                 cmd.extend(["--dmn-model", instance.dmn_model])
+        if instance.reader_api:
+            cmd.extend(["--reader-api", instance.reader_api])
+        if instance.reader_model:
+            cmd.extend(["--reader-model", instance.reader_model])
 
         log.write(f"[bold]$ {' '.join(cmd)}[/bold]\n")
 
@@ -306,6 +356,8 @@ class LaunchPage(Vertical):
                 "bot_name": instance.bot_name,
                 "api": instance.api,
                 "model": instance.model,
+                "reader_api": instance.reader_api,
+                "reader_model": instance.reader_model,
             }), encoding="utf-8")
         except Exception:
             pass
@@ -418,6 +470,8 @@ class LaunchPage(Vertical):
                 bot_name = data.get("bot_name", pid_file.parent.name)
                 api = data.get("api", "?")
                 model = data.get("model", "?")
+                reader_api = data.get("reader_api")
+                reader_model = data.get("reader_model")
             except Exception:
                 continue
 
@@ -431,6 +485,7 @@ class LaunchPage(Vertical):
 
             instance = BotInstance(
                 bot_name=bot_name, api=api, model=model,
+                reader_api=reader_api, reader_model=reader_model,
                 running=True, external_pid=pid,
             )
             STATE.instances[bot_name] = instance

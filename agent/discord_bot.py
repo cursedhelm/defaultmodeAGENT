@@ -15,6 +15,7 @@ import threading
 import re
 import importlib.util
 import sys
+from io import BytesIO
 from typing import Optional
 import traceback
 # import tools
@@ -25,9 +26,13 @@ from tools.todos.migration import migrate_todont_directory
 from tools.todos.models import Principal, TodoRequestContext
 from tools.todos.toolset import build_todo_tool_bundle
 from tools.todos.discord_commands import register_todo_commands
+from tools.bookshelf.factory import create_bookshelf_service
+from tools.bookshelf.toolset import build_bookshelf_tool_bundle
+from tools.bundle import merge_tool_bundles
 # import memory module
 from memory import UserMemoryIndex, CacheManager
 from defaultmode import DMNProcessor
+from reading import ReadingProcessor
 from chunker import truncate_middle, clean_response, balance_wraps
 from temporality import TemporalParser
 from thinking_trace import separate_thinking_traces, store_thinking_traces
@@ -46,6 +51,7 @@ from bot_config import (
 )
 # libraries logging import for jsonl, sqlite and info logging
 from logger import BotLogger
+from log_export import read_recent_jsonl
 from pydantic import BaseModel, Field
 
 init_logging()
@@ -604,6 +610,8 @@ def setup_bot(prompt_path=None, bot_id=None):
     bot.attention_enabled = True
     bot._slash_commands_synced = False
     bot.todo_service = None
+    bot.bookshelf_service = None
+    bot.reading_processor = None
 
     def _is_todo_manager(author) -> bool:
         permissions = getattr(author, 'guild_permissions', None)
@@ -621,8 +629,8 @@ def setup_bot(prompt_path=None, bot_id=None):
             is_bot=bool(getattr(user, 'bot', False)),
         )
 
-    def _build_tools_for_message(msg):
-        if not config.todo.enabled or bot.todo_service is None or msg.raw is None:
+    async def _build_tools_for_message(msg):
+        if msg.raw is None:
             return None
         raw = msg.raw
         actor = _principal(raw.author)
@@ -637,7 +645,7 @@ def setup_bot(prompt_path=None, bot_id=None):
             targets[principal.key] = principal
             targets[principal.display_name.casefold()] = principal
             targets[getattr(user, 'name', principal.display_name).casefold()] = principal
-        context = TodoRequestContext(
+        todo_context = TodoRequestContext(
             actor=actor,
             agent=agent,
             guild_id=str(raw.guild.id) if getattr(raw, 'guild', None) else None,
@@ -646,7 +654,29 @@ def setup_bot(prompt_path=None, bot_id=None):
             source="agent_tool",
             known_targets=targets,
         )
-        return build_todo_tool_bundle(bot.todo_service, context)
+        todo_bundle = (
+            build_todo_tool_bundle(bot.todo_service, todo_context)
+            if config.todo.enabled and bot.todo_service is not None else None
+        )
+        bookshelf_bundle = None
+        if config.bookshelf.enabled and bot.bookshelf_service is not None:
+            supported = {}
+            all_attachments = list(msg.attachments) + (
+                list(msg.reply_to.attachments) if msg.reply_to else []
+            )
+            for attachment in all_attachments:
+                if os.path.splitext(attachment.filename)[1].casefold() not in {'.pdf', '.epub'}:
+                    continue
+                if attachment.size > config.bookshelf.max_file_bytes:
+                    continue
+                supported[attachment.filename] = await attachment.read()
+            bookshelf_bundle = build_bookshelf_tool_bundle(
+                bot.bookshelf_service, _reader_id(bot), supported
+            )
+        return merge_tool_bundles(todo_bundle, bookshelf_bundle)
+
+    def _reader_id(runtime_bot):
+        return str(getattr(runtime_bot, 'reader_id', None) or getattr(runtime_bot, 'agent_name', None) or bot_id or 'default')
 
     bot.build_tools_for_message = _build_tools_for_message
     if config.todo.enabled:
@@ -674,8 +704,16 @@ def setup_bot(prompt_path=None, bot_id=None):
         bot.agent_name = bot.user.name
 
         bot.dmn_processor.logger = BotLogger(bot.user.name)
-        bot.loop.create_task(bot.dmn_processor.start())
-        bot.logger.info('DMN processor started')
+        async def _start_spike_and_dmn():
+            if bot.spike_processor is not None:
+                await bot.spike_processor.initialize()
+            await bot.dmn_processor.start()
+            bot.logger.info('DMN processor started')
+        bot.loop.create_task(_start_spike_and_dmn())
+        if bot.reading_processor is not None:
+            bot.reading_processor.logger = BotLogger(bot.user.name)
+            bot.loop.create_task(bot.reading_processor.start())
+            bot.logger.info('READER processor starting')
 
         # Warm the global theme cache off the request path. No-op when the
         # pickle already exists; on a cold corpus this moves full trigram
@@ -800,6 +838,12 @@ def setup_bot(prompt_path=None, bot_id=None):
                 f"**cooldown:** {cooldown_remaining:.0f}s remaining" if cooldown_remaining > 0 else "**cooldown:** ready",
                 f"**threshold:** {sp.config.match_threshold:.2f}"
             ]
+            latest = await asyncio.to_thread(sp.repository.latest)
+            if latest:
+                lines.append(
+                    f"**last action:** {latest.action or 'pending'} / {latest.status} "
+                    f"({'grounded' if latest.grounded else 'ungrounded'})"
+                )
             if surfaces:
                 lines.append("\n**recent surfaces:**")
                 for s in surfaces[:5]:
@@ -1300,6 +1344,37 @@ def setup_bot(prompt_path=None, bot_id=None):
         else:
             await ctx.send("Invalid action. Please use: start, stop, or status")
 
+    @bot.command(name='reader')
+    @commands.check(lambda ctx: config.discord.has_command_permission('reader', ctx))
+    async def reader_control(ctx, action: str = 'status'):
+        """Control or inspect this agent's background book reader."""
+        if bot.reading_processor is None:
+            await ctx.send("READER is disabled for this agent.")
+            return
+        action = action.casefold()
+        if action == 'start':
+            await bot.reading_processor.start()
+            await ctx.send("READER processor started.")
+        elif action == 'stop':
+            await bot.reading_processor.stop()
+            await ctx.send("READER processor stopped; its book position was preserved.")
+        elif action == 'status':
+            status = await bot.bookshelf_service.status(bot.reader_id)
+            if status.current_book and status.progress:
+                await ctx.send(
+                    f"READER is {'running' if bot.reading_processor.enabled else 'stopped'}: "
+                    f"{status.current_book.title} at {status.current_locator or 'the end'} "
+                    f"({status.percent_complete:.1f}%)."
+                )
+            else:
+                await ctx.send(
+                    f"READER is {'running' if bot.reading_processor.enabled else 'stopped'}; "
+                    f"{status.available_books} ready, {status.pending_books} pending, "
+                    f"{status.failed_books} failed books."
+                )
+        else:
+            await ctx.send("Invalid action. Please use: start, stop, or status")
+
     @bot.command(name='kill')
     @commands.check(lambda ctx: config.discord.has_command_permission('kill', ctx))
     async def kill_tasks(ctx):
@@ -1308,6 +1383,8 @@ def setup_bot(prompt_path=None, bot_id=None):
             bot.processing_enabled = False
             if bot.dmn_processor.enabled:
                 await bot.dmn_processor.stop()
+            if bot.reading_processor and bot.reading_processor.enabled:
+                await bot.reading_processor.stop()
             if hasattr(bot, 'spike_processor') and bot.spike_processor:
                 bot.spike_processor.enabled = False
             await ctx.send("Processing disabled. Ongoing API calls will complete but no new calls will be initiated.")
@@ -1323,6 +1400,8 @@ def setup_bot(prompt_path=None, bot_id=None):
         bot.processing_enabled = True
         if hasattr(bot, 'spike_processor') and bot.spike_processor:
             bot.spike_processor.enabled = True
+        if bot.reading_processor and not bot.reading_processor.enabled:
+            await bot.reading_processor.start()
         await ctx.send("Processing resumed.")
         bot.logger.info(f"Processing resumed by {ctx.author.name} (ID: {ctx.author.id})")
 
@@ -1346,51 +1425,73 @@ def setup_bot(prompt_path=None, bot_id=None):
 
     @bot.command(name='get_logs')
     @commands.check(lambda ctx: config.discord.has_command_permission('get_logs', ctx))
-    async def get_logs(ctx):
-        """Request bot logs via DM (most recent entries up to size limit)."""
+    async def get_logs(ctx, source: str = 'all'):
+        """DM recent bot/API JSONL without loading the complete logs into memory."""
+        aliases = {'calls': 'api', 'both': 'all'}
+        source = aliases.get(source.casefold().strip(), source.casefold().strip())
+        if source not in {'all', 'bot', 'api'}:
+            await ctx.send("Usage: `!get_logs [all|bot|api]`")
+            return
+
         try:
-            log_dir = os.path.join(config.logging.base_log_dir, bot.user.name, 'logs')
-            log_path = os.path.join(
-                log_dir,
-                config.logging.jsonl_pattern.format(bot_id=bot.user.name)
-            )
-            temp_path = os.path.join(
-                log_dir,
-                f'temp_{config.logging.jsonl_pattern.format(bot_id=bot.user.name)}'
-            )
-            if os.path.exists(log_path) and os.path.getsize(log_path) > 0:
-                MAX_SIZE = 1 * 1024 * 1024  # 1MB size limit
-                with open(log_path, 'r', encoding='utf-8') as source:
-                    lines = source.readlines()
-                    lines.reverse()
-                    size = 0
-                    recent_lines = []
-                    for line in lines:
-                        line_size = len(line.encode('utf-8'))
-                        if size + line_size > MAX_SIZE:
-                            break
-                        recent_lines.append(line)
-                        size += line_size
-                if recent_lines:
-                    with open(temp_path, 'w', encoding='utf-8') as temp:
-                        temp.writelines(recent_lines)
-                    try:
-                        await ctx.author.send(
-                            f"Most recent logs ({len(recent_lines)} entries)",
-                            file=discord.File(temp_path, filename=f"{bot.user.name}_recent_logs.jsonl")
-                        )
-                        if not isinstance(ctx.channel, discord.DMChannel):
-                            await ctx.send(f"{ctx.author.mention}, I've sent you the logs via DM.")
-                    except discord.Forbidden:
-                        await ctx.send("I couldn't send you a DM. Please check your privacy settings and try again.")
-                    finally:
-                        # Cleanup temp file
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
-                else:
-                    await ctx.send("No logs available within size limit.")
-            else:
-                await ctx.send("No logs available.")
+            max_bytes = 1 * 1024 * 1024
+            requested = []
+            if source in {'all', 'bot'}:
+                requested.append(('bot', getattr(bot.logger, 'jsonl_path', None)))
+            if source in {'all', 'api'}:
+                requested.append(('api', getattr(bot, 'api_log_path', None)))
+
+            exports = []
+            unavailable = []
+            for label, path in requested:
+                if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+                    unavailable.append(label)
+                    continue
+                export = await asyncio.to_thread(read_recent_jsonl, path, max_bytes)
+                if not export.payload:
+                    unavailable.append(label)
+                    continue
+                exports.append((label, export))
+
+            if not exports:
+                await ctx.send(
+                    "No requested logs are available yet. "
+                    "API logs begin in the per-bot log directory after restart."
+                )
+                return
+
+            safe_bot_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', bot.logger.bot_id)
+            streams = []
+            files = []
+            summary = []
+            for label, export in exports:
+                stream = BytesIO(export.payload)
+                streams.append(stream)
+                files.append(discord.File(
+                    stream,
+                    filename=f"{safe_bot_name}_recent_{label}_logs.jsonl",
+                ))
+                scope = "tail" if export.truncated else "complete file"
+                summary.append(
+                    f"{label}: {export.entry_count} entries, {scope}, "
+                    f"source {export.source_bytes:,} bytes"
+                )
+            if unavailable:
+                summary.append(f"unavailable: {', '.join(unavailable)}")
+
+            try:
+                await ctx.author.send("Recent logs\n" + "\n".join(summary), files=files)
+            finally:
+                for stream in streams:
+                    stream.close()
+
+            if not isinstance(ctx.channel, discord.DMChannel):
+                await ctx.send(f"{ctx.author.mention}, I've sent you the logs via DM.")
+        except discord.Forbidden:
+            await ctx.send("I couldn't send you a DM. Please check your privacy settings and try again.")
+        except discord.HTTPException as e:
+            bot.logger.error(f"Discord rejected log export: {e}")
+            await ctx.send("Discord rejected the log attachment. Try `!get_logs bot` or `!get_logs api` separately.")
         except Exception as e:
             bot.logger.error(f"Error retrieving logs: {str(e)}")
             await ctx.send(f"An error occurred while retrieving the logs: {str(e)}")
@@ -1431,6 +1532,10 @@ if __name__ == "__main__":
                         help='Choose the API to use for DMN processor (default: use main API)')
     parser.add_argument('--dmn-model', type=str,
                         help='Specify the model to use for DMN processor (default: use main model)')
+    parser.add_argument('--reader-api', choices=['ollama', 'llama-server', 'openai', 'anthropic', 'vllm', 'gemini', 'openrouter', 'unsloth'],
+                        help='Choose the API for the background READER (default: use main API)')
+    parser.add_argument('--reader-model', type=str,
+                        help='Specify the model for the background READER (default: use main model)')
     parser.add_argument('--use-chronpression', action='store_true',
                         help='Use chronomic compression instead of LLM for DMN thought distillation')
 
@@ -1459,6 +1564,10 @@ if __name__ == "__main__":
             logger.critical("No Discord token found in environment variables")
             exit(1)
     # Create private API client for this bot
+    args.api_log_path = os.path.join(
+        logger.log_dir,
+        f"api_calls_{logger.bot_id}.jsonl",
+    )
     private_api = load_private_api_client(args.bot_name or "default", args)
     # Override DMN config with command line arguments if provided
     if args.use_chronpression:
@@ -1468,6 +1577,7 @@ if __name__ == "__main__":
         config.dmn.dmn_model = args.dmn_model or config.dmn.dmn_model
         #logger.info(f"DMN API overridden: {config.dmn.dmn_api_type}, Model: {config.dmn.dmn_model}")
     bot = setup_bot(prompt_path=prompt_path, bot_id=args.bot_name)
+    bot.reader_id = args.bot_name or 'default'
     # Keep every Discord-triggered inference path off the gateway event loop.
     # All channel, reflection, DMN, spike, summary, and repo calls share this
     # async facade and are serialized on its dedicated worker thread.
@@ -1478,6 +1588,7 @@ if __name__ == "__main__":
     )
     # Attach per-bot API handles
     bot.api = private_api.api
+    bot.api_log_path = private_api.api.api_log_path
     bot.api_worker = api_worker
     bot.call_api = api_worker.call_api
     bot.update_api_temperature = private_api.update_api_temperature
@@ -1491,6 +1602,14 @@ if __name__ == "__main__":
                 migrate_todont_directory(bot.todo_service, config.todo.import_directory)
             )
             bot.logger.info(f"Todo migration: {migration_result}")
+    if args.reader_api or args.reader_model:
+        config.reading.reader_api_type = args.reader_api or config.reading.reader_api_type
+        config.reading.reader_model = args.reader_model or config.reading.reader_model
+    if config.bookshelf.enabled:
+        bot.bookshelf_service = create_bookshelf_service(
+            bot.cache.get_cache_dir('bookshelf'), config.bookshelf,
+            private_api.get_embeddings, bot.logger,
+        )
     # Initialize DMN processor after API client is attached
     bot.dmn_processor = DMNProcessor(
         memory_index=bot.memory_index,
@@ -1502,11 +1621,21 @@ if __name__ == "__main__":
     )
     # Sync initial amygdala arousal
     bot.dmn_processor.set_amygdala_response(bot.amygdala_response)
+    if config.bookshelf.enabled and bot.bookshelf_service is not None:
+        bot.reading_processor = ReadingProcessor(
+            bookshelf=bot.bookshelf_service,
+            memory_index=bot.memory_index,
+            prompt_formats=bot.prompt_formats,
+            system_prompts=bot.system_prompts,
+            runtime=bot,
+            reader_id=bot.reader_id,
+            reading_config=config.reading,
+        )
     # Initialize spike processor (enabled by default, toggle via !spike on/off)
     bot.spike_processor = SpikeProcessor(
         bot,
         bot.memory_index,
-        cache_path=os.path.join('cache', args.bot_name or 'default', 'spike')
+        cache_path=bot.cache.get_cache_dir('spike')
     )
     # Publish the same versioned, read-only state hook used by in-process TUI
     # Chat. The endpoint is localhost-only and never writes memory_cache.pkl.

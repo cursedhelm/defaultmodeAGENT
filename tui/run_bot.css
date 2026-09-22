@@ -127,6 +127,7 @@ LaunchPage { height: 1fr; background: $bg; }
 #api-list { height: 1fr; max-height: 8; }
 #model-list { height: 1fr; }
 #dmn-api-list { height: 1fr; max-height: 9; }
+#reader-api-list { height: 1fr; max-height: 9; }
 #dmn-model-list { height: 1fr; }
 #config-summary { height: auto; margin-bottom: 1; }
 

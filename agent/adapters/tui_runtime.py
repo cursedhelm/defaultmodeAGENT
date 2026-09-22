@@ -50,6 +50,15 @@ class TUIRuntime:
             create_todo_service(config.todo, mod.get_embeddings, self._log)
             if config.todo.enabled else None
         )
+        from memory import CacheManager
+        from tools.bookshelf.factory import create_bookshelf_service
+        self.reader_id = bot_name
+        self.bookshelf_service = (
+            create_bookshelf_service(
+                CacheManager(bot_name).get_cache_dir("bookshelf"),
+                config.bookshelf, mod.get_embeddings, self._log,
+            ) if config.bookshelf.enabled else None
+        )
 
     # ── AgentRuntime identity ──────────────────────────────────────────────────
 
@@ -100,10 +109,12 @@ class TUIRuntime:
         return await self._api.call_api(**kwargs)
 
     def build_tools_for_message(self, msg):
-        if self.todo_service is None:
+        if self.todo_service is None and self.bookshelf_service is None:
             return None
         from tools.todos.models import Principal, TodoRequestContext
         from tools.todos.toolset import build_todo_tool_bundle
+        from tools.bookshelf.toolset import build_bookshelf_tool_bundle
+        from tools.bundle import merge_tool_bundles
 
         raw_actor_id = str(msg.author_id)
         actor_key = (
@@ -122,7 +133,12 @@ class TUIRuntime:
             channel_id=str(msg.channel_id),
             source="tui",
         )
-        return build_todo_tool_bundle(self.todo_service, context)
+        todo_bundle = build_todo_tool_bundle(self.todo_service, context) if self.todo_service else None
+        bookshelf_bundle = (
+            build_bookshelf_tool_bundle(self.bookshelf_service, self.reader_id)
+            if self.bookshelf_service else None
+        )
+        return merge_tool_bundles(todo_bundle, bookshelf_bundle)
 
     def update_api_temperature(self, temperature: float) -> None:
         self._api.update_api_temperature(temperature)

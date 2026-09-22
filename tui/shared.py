@@ -55,6 +55,8 @@ class BotInstance:
     model: str
     dmn_api: Optional[str] = None
     dmn_model: Optional[str] = None
+    reader_api: Optional[str] = None
+    reader_model: Optional[str] = None
     process: Optional[Any] = None
     running: bool = False
     worker: Optional[Any] = None
@@ -154,6 +156,8 @@ class AppState:
         self.selected_model: Optional[str] = None
         self.dmn_api: Optional[str] = None
         self.dmn_model: Optional[str] = None
+        self.reader_api: Optional[str] = None
+        self.reader_model: Optional[str] = None
         self.instances: Dict[str, BotInstance] = {}
         self._live_contexts: Dict[str, LiveBotContext] = {}
         self._live_lock = threading.RLock()

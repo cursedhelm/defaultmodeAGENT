@@ -15,8 +15,9 @@
 | `!attention` | Enable/disable attention trigger responses | ✓ | ✓ | ✗ |
 | `!kill` | Gracefully terminate API processing | ✓ | ✗ | ✗ |
 | `!resume` | Resume API processing | ✓ | ✗ | ✗ |
-| `!get_logs` | Download bot logs | ✓ | ✗ | ✗ |
+| `!get_logs [all\|bot\|api]` | Download recent bot/API logs | ✓ | ✗ | ✗ |
 | `!dmn` | Control DMN processor | ✓ | ✗ | ✗ |
+| `!reader` | Control READER and inspect book progress | ✓ | ✗ | ✗ |
 | `!mentions` | Toggle mention conversion state | ✓ | ✗ | ✗ |
 | `!persona` | Set or get AI's amygdala arousal | ✓ | ✗ | ✗ |
 | `!search_memories` | Search through stored memories | ✓ | ✗ | ✗ |
@@ -90,9 +91,13 @@
 - **Description**: Resume API processing after being killed
 - **Usage**: `!resume`
 
-#### `!get_logs`
-- **Description**: Download bot logs (recent entries up to 1MB)
-- **Usage**: `!get_logs`
+#### `!get_logs [source]`
+- **Description**: DM a bounded tail of the current agent's bot and/or API JSONL logs without loading the full files into memory
+- **Usage**:
+  - `!get_logs` or `!get_logs all` - Send both available exports
+  - `!get_logs bot` - Send structured bot events
+  - `!get_logs api` - Send full API request/response records
+- **Note**: Each attachment contains up to 1MB of complete recent JSONL entries. API logs are isolated per bot after restart.
 
 #### `!dmn [action]`
 - **Description**: Control the DMN (Default Mode Network) processor for background thought generation
@@ -100,6 +105,13 @@
   - `!dmn status` - Check DMN status
   - `!dmn start` - Start DMN processor
   - `!dmn stop` - Stop DMN processor
+
+#### `!reader [action]`
+- **Description**: Start, stop, or inspect the background PDF/EPUB READER
+- **Usage**:
+  - `!reader status` - Show the current book, position, and library counts
+  - `!reader start` - Resume background reading from the saved cursor
+  - `!reader stop` - Stop reading without losing the saved cursor
 
 #### `!mentions [state]`
 - **Description**: Toggle or check mention conversion state (whether @usernames are converted to Discord mentions)
